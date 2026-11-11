@@ -1,0 +1,644 @@
+import streamlit as st
+import pandas as pd
+import plotly.express as px
+import os
+import itertools
+import uuid
+import json
+import requests
+import time
+from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor
+import streamlit.components.v1 as components
+from sqlalchemy import create_engine, text
+
+# ================= 🎨 页面配置与 UI CSS =================
+st.set_page_config(page_title="数据量化终端", layout="wide", page_icon="📊")
+
+st.markdown("""
+    <style>
+    header[data-testid="stHeader"] { display: none !important; }
+    .block-container { 
+        padding-top: 0.5rem !important; padding-bottom: 0.5rem !important; 
+        padding-left: 1rem !important; padding-right: 1rem !important;
+    }
+    div[data-testid="stVerticalBlock"] { gap: 0.5rem !important; }
+    .stApp { background-color: #0A0A0A; color: #E5E5E5; }
+    div[data-testid="stVerticalBlock"] > div:has(div.custom-card) {
+        background-color: #121212; border: 1px solid #262626;
+        border-radius: 6px; padding: 10px 15px; margin-bottom: 10px;
+    }
+    h1, h2, h3 { color: #FFFFFF !important; font-family: -apple-system, sans-serif; margin-bottom: 0px !important; }
+    label { color: #A3A3A3 !important; font-size: 12px !important; padding-bottom: 0px !important; }
+    div[data-baseweb="input"] > div, div[data-baseweb="select"] > div, textarea {
+        background-color: #1A1A1A !important; border: 1px solid #333 !important; color: #FFF !important; min-height: 30px !important;
+    }
+    .stButton>button {
+        border-radius: 4px; border: 1px solid #333; background-color: #1A1A1A;
+        color: #FFF; font-weight: 500; transition: all 0.2s; padding: 0.2rem 0.5rem !important;
+    }
+    .stButton>button:hover { border-color: #22C55E; color: #22C55E; }
+    .stButton>button[kind="primary"] { background-color: #22C55E; color: #000; border: none; }
+    [data-testid="stSidebar"] { background-color: #0F0F0F; border-right: 1px solid #262626; }
+    
+    .ball-container { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+    .ball {
+        display: inline-flex; align-items: center; justify-content: center;
+        width: 28px; height: 28px; border-radius: 50%;
+        font-weight: bold; font-size: 13px; box-shadow: 0 2px 4px rgba(0,0,0,0.3);
+    }
+    .ball-default { background-color: #1A1A1A; color: #FFF; border: 1px solid #555; }
+    .ball-red { background-color: #7F1D1D; color: #FCA5A5; border: 1px solid #EF4444; }
+    .ball-blue { background-color: #1E3A8A; color: #93C5FD; border: 1px solid #3B82F6; }
+    .ball-green { background-color: #14532D; color: #86EFAC; border: 1px solid #22C55E; }
+    .ball-special { box-shadow: 0 0 8px 1px rgba(255, 255, 255, 0.4); transform: scale(1.05); font-weight: 900; }
+    
+    .huge-number { font-size: 28px; font-weight: 800; line-height: 1.1; }
+    .profit { color: #22C55E; }
+    .loss { color: #EF4444; }
+    .text-gray { color: #A3A3A3; font-size: 12px; }
+    .peak-text-pos { color: #22C55E; font-size: 12px; font-weight: bold; margin-top: 3px; }
+    .peak-text-neg { color: #EF4444; font-size: 12px; font-weight: bold; margin-top: 3px; }
+    </style>
+""", unsafe_allow_html=True)
+
+# ================= 🗄️ 云端数据库配置 =================
+# 部署到 Streamlit Cloud 时，通过 Secrets 读取
+DB_URL = st.secrets["DB_URL"]
+
+@st.cache_resource
+def get_db_engine():
+    return create_engine(DB_URL)
+
+engine = get_db_engine()
+
+# ================= 🎱 六合彩波色字典 =================
+RED_BALLS = {1, 2, 7, 8, 12, 13, 18, 19, 23, 24, 29, 30, 34, 35, 40, 45, 46}
+BLUE_BALLS = {3, 4, 9, 10, 14, 15, 20, 25, 26, 31, 36, 37, 41, 42, 47, 48}
+GREEN_BALLS = {5, 6, 11, 16, 17, 21, 22, 27, 28, 32, 33, 38, 39, 43, 44, 49}
+
+def get_ball_class(num, is_special=False):
+    base_class = "ball-default"
+    if num in RED_BALLS: base_class = "ball-red"
+    elif num in BLUE_BALLS: base_class = "ball-blue"
+    elif num in GREEN_BALLS: base_class = "ball-green"
+    if is_special: return f"{base_class} ball-special"
+    return base_class
+
+def play_beep_sound():
+    js = """
+    <script>
+    function playSound() {
+        var context = new (window.AudioContext || window.webkitAudioContext)();
+        var osc = context.createOscillator(); var gain = context.createGain();
+        osc.connect(gain); gain.connect(context.destination);
+        osc.type = 'sine'; osc.frequency.setValueAtTime(880, context.currentTime);
+        gain.gain.setValueAtTime(0.5, context.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.001, context.currentTime + 0.8);
+        osc.start(); osc.stop(context.currentTime + 0.8);
+    }
+    playSound();
+    </script>
+    """
+    components.html(js, height=0, width=0)
+
+# ================= 🔄 数据抓取逻辑 =================
+LOTTERY_MAP = {
+    "香港六合彩": {"code": "HK6", "type": "dpc"},
+    "快乐8六合彩": {"code": "KLLHC", "type": "dpc"},
+    "宾果六合彩": {"code": "TWBGLHC", "type": "gpc"},
+    "加拿大六合彩": {"code": "JNDLHC", "type": "gpc"}
+}
+
+def fetch_api(url, headers):
+    try:
+        res = requests.get(url, headers=headers, timeout=5)
+        if res.status_code == 200:
+            return res.json().get("data", {}).get("list", [])
+    except Exception: pass
+    return []
+
+def update_latest_data(lottery_name, status_container=None):
+    config = LOTTERY_MAP.get(lottery_name)
+    if not config: return False, "未知彩种"
+    
+    if status_container: status_container.info("正在读取数据库最新日期...")
+    try:
+        df_old = pd.read_sql(f"SELECT issue, draw_time FROM lottery_data WHERE lottery_name = '{lottery_name}' ORDER BY draw_time DESC LIMIT 1", engine)
+        if df_old.empty:
+            start_date = datetime.today().date() - timedelta(days=3) 
+        else:
+            max_date = pd.to_datetime(df_old.iloc[0]['draw_time']).date()
+            start_date = max_date - timedelta(days=1)
+    except Exception as e:
+        return False, f"❌ 数据库连接失败: {e}"
+
+    end_date = datetime.today().date()
+    if start_date > end_date: return False, "已是最新"
+    
+    all_new_data = []
+    headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://166kai.com/"}
+    delta_days = (end_date - start_date).days + 1
+
+    if config["type"] == "dpc":
+        for day_offset in range(delta_days):
+            target_date = start_date + timedelta(days=day_offset)
+            y, m, d = target_date.strftime("%Y"), target_date.month, target_date.day
+            url = f"https://data.kai8.us/api/lottery/history_dpc/KAI166/{config['code']}/{y}/{m}/{d}"
+            records = fetch_api(url, headers)
+            for item in records:
+                all_new_data.append({"lottery_name": lottery_name, "issue": str(item.get("issue")).strip(), "draw_time": item.get("draw_time"), "draw_code": item.get("draw_code")})
+    else:
+        if status_container: status_container.info("正在通过高频通道极速抓取...")
+        urls_to_fetch = []
+        for day_offset in range(delta_days):
+            target_date = start_date + timedelta(days=day_offset)
+            y, m, d = target_date.strftime("%Y"), target_date.month, target_date.day
+            for h in range(24):
+                url = f"https://data.kai8.us/api/lottery/history_gpc/KAI166/{config['code']}/{y}-{m:02d}-{d:02d}/{h}/30"
+                urls_to_fetch.append(url)
+                
+        with ThreadPoolExecutor(max_workers=15) as executor:
+            results = executor.map(lambda u: fetch_api(u, headers), urls_to_fetch)
+            for records in results:
+                for item in records:
+                    all_new_data.append({"lottery_name": lottery_name, "issue": str(item.get("issue")).strip(), "draw_time": item.get("draw_time"), "draw_code": item.get("draw_code")})
+
+    if not all_new_data: return False, "⚠️ 接口未返回新数据"
+    
+    df_new = pd.DataFrame(all_new_data)
+    df_new['issue'] = df_new['issue'].astype(str).str.strip()
+    df_new['draw_time'] = pd.to_datetime(df_new['draw_time'], errors='coerce').dt.tz_localize(None)
+    df_new = df_new.dropna(subset=['draw_time'])
+    df_new = df_new.drop_duplicates(subset=['lottery_name', 'issue'], keep='first')
+    
+    if df_new.empty: return False, "⚠️ 抓到的数据无效，已跳过。"
+
+    if status_container: status_container.info("正在写入数据库 (自动跳过重复)...")
+    
+    # 使用 ON CONFLICT DO NOTHING 语法，遇到重复直接忽略，绝不报错
+    try:
+        records = df_new.to_dict('records')
+        sql = text("""
+            INSERT INTO lottery_data (lottery_name, issue, draw_time, draw_code)
+            VALUES (:lottery_name, :issue, :draw_time, :draw_code)
+            ON CONFLICT (lottery_name, issue) DO NOTHING
+        """)
+        
+        with engine.begin() as conn:
+            conn.execute(sql, records)
+            
+        return True, f"✅ 抓取完成！已同步至云端 (自动跳过重复项)"
+    except Exception as e:
+        return False, f"❌ 写入数据库失败: {e}"
+
+# ================= 💾 方案保存逻辑 =================
+def save_schemes():
+    try:
+        df = pd.DataFrame([{"id": s["id"], "scheme_json": json.dumps(s)} for s in st.session_state.schemes])
+        with engine.begin() as conn:
+            conn.execute(text("DELETE FROM saved_schemes"))
+        if not df.empty:
+            df.to_sql('saved_schemes', engine, if_exists='append', index=False)
+    except Exception as e:
+        st.error(f"方案保存云端失败: {e}")
+
+def load_schemes():
+    try:
+        df = pd.read_sql("SELECT scheme_json FROM saved_schemes", engine)
+        return [json.loads(row) for row in df['scheme_json']]
+    except:
+        return []
+
+if 'schemes' not in st.session_state: st.session_state.schemes = load_schemes() 
+if 'editing_id' not in st.session_state: st.session_state.editing_id = None
+if 'update_msg' not in st.session_state: st.session_state.update_msg = None
+
+if "chart_height" not in st.session_state: st.session_state.chart_height = int(st.query_params.get("chart_height", 350))
+if "pos_alert" not in st.session_state: st.session_state.pos_alert = float(st.query_params.get("pos_alert", 10000.0))
+if "neg_alert" not in st.session_state: st.session_state.neg_alert = float(st.query_params.get("neg_alert", -5000.0))
+
+def sync_alerts_to_url():
+    st.query_params["pos_alert"] = str(st.session_state.pos_alert)
+    st.query_params["neg_alert"] = str(st.session_state.neg_alert)
+
+# ================= 1. 数据解析 =================
+available_lotteries = list(LOTTERY_MAP.keys())
+
+def parse_draw(row):
+    # 兼容来自 API 的 draw_code 列或数据库读取出的中文列名
+    code_str = str(row["draw_code"]) if "draw_code" in row else str(row["开奖号码"])
+    nums = [int(x) for x in code_str.replace('"', '').replace("'", "").split(",") if x.strip().isdigit()]
+    if len(nums) >= 7: return sorted(nums[:6]), nums[-1]
+    return [], 0
+
+# ================= 2. 侧边栏控制台 =================
+st.sidebar.markdown("### ⚙️ 全局控制")
+st.sidebar.markdown("**📅 快捷时间**")
+btn_col1, btn_col2, btn_col3 = st.sidebar.columns(3)
+today = datetime.today().date()
+yesterday = today - timedelta(days=1)
+week_start = today - timedelta(days=today.weekday())
+
+if btn_col1.button("今天", use_container_width=True): st.session_state.date_range = (today, today)
+if btn_col2.button("昨天", use_container_width=True): st.session_state.date_range = (yesterday, yesterday)
+if btn_col3.button("本周", use_container_width=True): st.session_state.date_range = (week_start, today)
+
+if 'date_range' not in st.session_state: st.session_state.date_range = (today, today)
+start_date = st.sidebar.date_input("开始日期", value=st.session_state.date_range[0])
+end_date = st.sidebar.date_input("结束日期", value=st.session_state.date_range[1])
+
+st.sidebar.markdown("---")
+st.sidebar.markdown("### 📝 方案管理")
+
+is_editing = st.session_state.editing_id is not None
+edit_scheme = next((s for s in st.session_state.schemes if s['id'] == st.session_state.editing_id), None) if is_editing else None
+form_title = "✏️ 修改方案" if is_editing else "➕ 新增方案"
+
+with st.sidebar.expander(form_title, expanded=is_editing):
+    if is_editing: st.info(f"正在修改：{edit_scheme['name']}")
+
+    def_name = edit_scheme['name'] if is_editing else f"方案 {len(st.session_state.schemes) + 1}"
+    def_group = edit_scheme.get('group_name', '') if is_editing else ""
+    def_cat = edit_scheme['category'] if is_editing else "连码复式"
+    def_sub = edit_scheme['sub_type'] if is_editing else "3中3"
+    def_nums = " ".join(map(str, edit_scheme['numbers'])) if is_editing else "4 5 9 14 17 37 41 42 47"
+    def_nums2 = " ".join(map(str, edit_scheme['numbers2'])) if is_editing and edit_scheme.get('numbers2') else ""
+    def_pos = edit_scheme['pos_index'] if is_editing else 1
+    def_bet = edit_scheme['bet'] if is_editing else 10
+    def_rebate = edit_scheme['rebate'] if is_editing else 0.155
+
+    scheme_name = st.text_input("方案名称", value=def_name)
+    group_name = st.text_input("📦 所属组合 (可选)", value=def_group, placeholder="比如：544大方案")
+    category = st.selectbox("玩法类目", ["连码复式", "连码对碰", "特码类"], index=["连码复式", "连码对碰", "特码类"].index(def_cat))
+    
+    if is_editing:
+        odds_val_1 = float(edit_scheme.get('odds_1') or 700.0)
+        odds_val_2 = float(edit_scheme.get('odds_2') or 125.0)
+    else:
+        odds_val_1, odds_val_2 = 700.0, 125.0
+
+    if category == "特码类":
+        sub_cat = st.selectbox("玩法细分", ["特码", "正码特"], index=["特码", "正码特"].index(def_sub) if def_sub in ["特码", "正码特"] else 0)
+        pos_index = st.selectbox("指定位置 (1-6正码，7特码)", [1,2,3,4,5,6,7], index=def_pos-1)
+        numbers_str = st.text_input("号码池", value=def_nums)
+        numbers2_str = ""
+        odds_val_1 = st.number_input("手动设置赔率", value=odds_val_1, step=1.0)
+        odds_val_2 = None
+    elif category == "连码复式":
+        sub_cat = st.selectbox("玩法细分", ["3中3", "3中2", "2中2", "特串"], index=["3中3", "3中2", "2中2", "特串"].index(def_sub) if def_sub in ["3中3", "3中2", "2中2", "特串"] else 0)
+        numbers_str = st.text_input("号码池", value=def_nums)
+        numbers2_str = st.text_input("特码池", value=def_nums2) if sub_cat == "特串" else ""
+        if sub_cat == "3中2":
+            col1, col2 = st.columns(2)
+            with col1: odds_val_1 = st.number_input("中2个赔率", value=odds_val_1, step=1.0)
+            with col2: odds_val_2 = st.number_input("中3个赔率", value=odds_val_2, step=1.0)
+        else:
+            default_odds = 700.0 if sub_cat == "3中3" else (65.8 if sub_cat == "2中2" else 165.0)
+            odds_val_1 = st.number_input("手动设置赔率", value=odds_val_1 if is_editing else default_odds, step=1.0)
+            odds_val_2 = None
+        pos_index = 0
+    else: 
+        sub_cat = st.selectbox("玩法细分", ["3中3", "3中2", "2中2", "特串"], index=["3中3", "3中2", "2中2", "特串"].index(def_sub) if def_sub in ["3中3", "3中2", "2中2", "特串"] else 0)
+        numbers_str = st.text_input("左边号码组 (组A)", value=def_nums)
+        numbers2_str = st.text_input("右边号码组 (组B)", value=def_nums2)
+        if sub_cat == "3中2":
+            col1, col2 = st.columns(2)
+            with col1: odds_val_1 = st.number_input("中2个赔率", value=odds_val_1, step=1.0)
+            with col2: odds_val_2 = st.number_input("中3个赔率", value=odds_val_2, step=1.0)
+        else:
+            default_odds = 700.0 if sub_cat == "3中3" else (65.8 if sub_cat == "2中2" else 165.0)
+            odds_val_1 = st.number_input("手动设置赔率", value=odds_val_1 if is_editing else default_odds, step=1.0)
+            odds_val_2 = None
+        pos_index = 0
+
+    bet_amount = st.number_input("单注金额", value=def_bet, step=1)
+    rebate = st.number_input("退水比例", value=def_rebate, step=0.005, format="%.3f")
+
+    btn_text = "💾 保存修改" if is_editing else "➕ 添加方案"
+    if st.button(btn_text, use_container_width=True, type="primary"):
+        try:
+            num_pool = [int(x) for x in numbers_str.replace(",", " ").split()]
+            num_pool2 = [int(x) for x in numbers2_str.replace(",", " ").split()] if numbers2_str else []
+            new_scheme = {
+                "id": edit_scheme['id'] if is_editing else str(uuid.uuid4()),
+                "name": scheme_name, "group_name": group_name, "category": category, 
+                "sub_type": sub_cat, "pos_index": pos_index, "numbers": num_pool, "numbers2": num_pool2, 
+                "bet": bet_amount, "rebate": rebate, "odds_1": odds_val_1, "odds_2": odds_val_2, 
+                "active": edit_scheme['active'] if is_editing else True
+            }
+            if is_editing:
+                idx = next(i for i, s in enumerate(st.session_state.schemes) if s['id'] == st.session_state.editing_id)
+                st.session_state.schemes[idx] = new_scheme
+                st.session_state.editing_id = None
+            else:
+                st.session_state.schemes.append(new_scheme)
+            save_schemes()
+            st.rerun()
+        except: st.error("号码格式有误！")
+    if is_editing:
+        if st.button("取消修改", use_container_width=True): 
+            st.session_state.editing_id = None
+            st.rerun()
+
+active_schemes = []
+def render_scheme_row(s):
+    c1, c2, c3 = st.columns([3, 1, 1])
+    is_active = c1.checkbox(s['name'], value=s['active'], key=f"chk_{s['id']}")
+    if is_active != s['active']: s['active'] = is_active; save_schemes()
+    if c2.button("改", key=f"e_{s['id']}"): st.session_state.editing_id = s['id']; st.rerun()
+    if c3.button("删", key=f"d_{s['id']}"):
+        st.session_state.schemes = [x for x in st.session_state.schemes if x['id'] != s['id']]
+        save_schemes(); st.rerun()
+    if s['active']: active_schemes.append(s)
+
+if st.session_state.schemes:
+    with st.sidebar.expander("📁 已保存的方案列表", expanded=True):
+        groups = {}
+        for s in st.session_state.schemes:
+            g_name = s.get('group_name', '').strip() or "（未分组）"
+            groups.setdefault(g_name, []).append(s)
+            
+        for g_name, s_list in groups.items():
+            if g_name == "（未分组）":
+                for s in s_list: render_scheme_row(s)
+            else:
+                group_active = all(s['active'] for s in s_list)
+                new_group_active = st.checkbox(f"📦 {g_name}", value=group_active, key=f"grp_{g_name}")
+                if new_group_active != group_active:
+                    for s in s_list: s['active'] = new_group_active
+                    save_schemes(); st.rerun()
+                with st.expander(f"🔽 查看 {g_name} 内的 {len(s_list)} 个方案", expanded=False):
+                    for s in s_list: render_scheme_row(s)
+
+# ================= 3. 主界面：控制台 =================
+st.markdown(f"<h2 style='font-size: 20px; display:inline-block;'>📊 历史盈亏回测</h2> <span style='font-size:12px;color:#A3A3A3;margin-left:10px;'>范围: {start_date} 至 {end_date}</span>", unsafe_allow_html=True)
+
+status_box = st.empty()
+
+c_lottery, c_time = st.columns([1.5, 2.5])
+with c_lottery:
+    selected_lottery = st.selectbox("🎯 目标彩种", available_lotteries)
+    is_high_freq = ("宾果" in selected_lottery or "加拿大" in selected_lottery)
+    
+    if is_high_freq:
+        if "last_checked" not in st.session_state or st.session_state.get("last_lottery") != selected_lottery or (datetime.now() - st.session_state.last_checked).total_seconds() > 30:
+            with st.spinner("云端极速并发获取数据中..."):
+                success, msg = update_latest_data(selected_lottery, status_box)
+                st.session_state.last_checked = datetime.now()
+                st.session_state.last_lottery = selected_lottery
+                if success: status_box.success(msg)
+                else: status_box.warning(msg)
+
+    try:
+        query = f"SELECT issue as 期号, draw_time as 开奖日期, draw_code as 开奖号码 FROM lottery_data WHERE lottery_name = '{selected_lottery}'"
+        df_all = pd.read_sql(query, engine)
+        df_all["开奖日期"] = pd.to_datetime(df_all["开奖日期"], errors='coerce').dt.tz_localize(None)
+        df_all["日期_only"] = df_all["开奖日期"].dt.date
+        df_all = df_all.dropna(subset=["开奖日期"]).sort_values(by="期号", ascending=True)
+    except Exception as e:
+        st.error(f"读取图表数据失败: {e}")
+        df_all = pd.DataFrame()
+
+with c_time:
+    time_filter = st.text_input("🕒 时间过滤(可选)", value="", placeholder="例: 08:20") if is_high_freq else ""
+
+if not df_all.empty:
+    latest_row = df_all.iloc[-1]
+    latest_issue, latest_date = latest_row['期号'], latest_row['开奖日期'].strftime('%Y-%m-%d %H:%M')
+    latest_normals, latest_special = parse_draw(latest_row)
+    
+    if latest_normals:
+        balls_html = "".join([f"<div class='ball {get_ball_class(n)}'>{n:02d}</div>" for n in latest_normals])
+        balls_html += f"<div class='ball {get_ball_class(latest_special, True)}'>{latest_special:02d}</div>"
+        st.markdown(f"""
+        <div style="background-color: #121212; border: 1px solid #262626; border-radius: 6px; padding: 8px 12px; margin-top: 5px; margin-bottom: 10px; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px;">
+            <div><span style="color: #FFF; font-weight: bold; font-size: 14px;">第 {latest_issue} 期</span><span style="color: #666; font-size: 12px; margin-left: 10px;">{latest_date}</span></div>
+            <div class="ball-container">{balls_html}</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+if not is_high_freq:
+    with st.expander("🔄 手动数据更新", expanded=True):
+        c_sync1, c_sync2 = st.columns([1.5, 3.5])
+        with c_sync1:
+            if st.button("🔄 点击获取最新开奖数据", use_container_width=True, type="primary"):
+                with st.spinner("正在请求接口..."):
+                    success, msg = update_latest_data(selected_lottery, status_box)
+                    st.session_state.update_msg = ("success" if success else "error", msg)
+                    st.rerun()
+        with c_sync2:
+            if st.session_state.update_msg:
+                status, msg = st.session_state.update_msg
+                if status == "success": st.success(msg, icon="✅")
+                else: st.error(msg, icon="❌")
+                st.session_state.update_msg = None
+            else:
+                st.info("香港六合彩与快乐8每日开奖频率低，建议手动点击获取。")
+else:
+    with st.expander("⚙️ 高频彩自动更新 与 报警线设置", expanded=False):
+        c_alert1, c_alert2 = st.columns(2)
+        with c_alert1: st.number_input("📈 正峰值报警线 (元) - 止盈", step=1000.0, key="pos_alert", on_change=sync_alerts_to_url)
+        with c_alert2: st.number_input("📉 负峰值报警线 (元) - 止损", step=-1000.0, key="neg_alert", on_change=sync_alerts_to_url)
+        new_height = st.slider("图表高度", min_value=250, max_value=900, value=st.session_state.chart_height, step=50)
+        if new_height != st.session_state.chart_height:
+            st.session_state.chart_height = new_height
+            st.query_params["chart_height"] = str(new_height)
+            st.rerun()
+
+# ================= 4. 计算引擎 =================
+def calculate_scheme(df, scheme, time_filter=""):
+    cat, sub = scheme['category'], scheme['sub_type']
+    if cat == "特码类": bet_count = len(scheme['numbers'])
+    elif cat == "连码复式":
+        n = len(scheme['numbers'])
+        if sub in ["3中3", "3中2"]: bet_count = len(list(itertools.combinations(range(n), 3)))
+        elif sub == "2中2": bet_count = len(list(itertools.combinations(range(n), 2)))
+        else: bet_count = n * len(scheme['numbers2']) if scheme.get('numbers2') else n
+    else: 
+        L, R = len(scheme['numbers']), len(scheme['numbers2'])
+        if sub in ["2中2", "特串"]: bet_count = L * R
+        else: bet_count = int(L*(L-1)/2)*R + L*int(R*(R-1)/2)
+    actual_cost = bet_count * scheme['bet'] * (1 - scheme['rebate'])
+
+    results = []
+    for _, row in df.iterrows():
+        if time_filter and time_filter not in row['开奖日期'].strftime('%H:%M'): continue
+        draw_normals, draw_special = set(row['正码']), row['特码']
+        h2, h3, hn = 0, 0, 0
+        
+        if cat == "特码类":
+            pos_idx = scheme['pos_index'] - 1
+            draw_num = row['正码'][pos_idx] if pos_idx < 6 else row['特码']
+            if draw_num in scheme['numbers']: hn = scheme['numbers'].count(draw_num)
+        elif cat == "连码复式":
+            nums = scheme['numbers']
+            if sub in ["3中3", "3中2"]:
+                for grp in itertools.combinations(nums, 3):
+                    match = sum(1 for n in grp if n in draw_normals)
+                    if sub == "3中3" and match == 3: hn += 1
+                    elif sub == "3中2":
+                        if match == 2: h2 += 1
+                        elif match == 3: h3 += 1
+            elif sub == "2中2":
+                for grp in itertools.combinations(nums, 2):
+                    if all(n in draw_normals for n in grp): hn += 1
+            elif sub == "特串":
+                for n in nums:
+                    for sp in scheme['numbers2']:
+                        if n in draw_normals and sp == draw_special: hn += 1
+        elif cat == "连码对碰":
+            L_nums, R_nums = scheme['numbers'], scheme['numbers2']
+            if sub == "2中2":
+                for l in L_nums:
+                    for r in R_nums:
+                        if l in draw_normals and r in draw_normals: hn += 1
+            elif sub == "特串":
+                for l in L_nums:
+                    for r in R_nums:
+                        if (l in draw_normals and r == draw_special) or (l == draw_special and r in draw_normals): hn += 1
+            elif sub in ["3中3", "3中2"]:
+                for l_pair in itertools.combinations(L_nums, 2):
+                    for r in R_nums:
+                        match = sum(1 for n in (list(l_pair) + [r]) if n in draw_normals)
+                        if sub == "3中3" and match == 3: hn += 1
+                        elif sub == "3中2":
+                            if match == 2: h2 += 1
+                            elif match == 3: h3 += 1
+                for l in L_nums:
+                    for r_pair in itertools.combinations(R_nums, 2):
+                        match = sum(1 for n in ([l] + list(r_pair)) if n in draw_normals)
+                        if sub == "3中3" and match == 3: hn += 1
+                        elif sub == "3中2":
+                            if match == 2: h2 += 1
+                            elif match == 3: h3 += 1
+
+        prize = (h2 * scheme['bet'] * scheme['odds_1'] + h3 * scheme['bet'] * scheme['odds_2']) if sub == "3中2" else (hn * scheme['bet'] * scheme['odds_1'])
+        pl = prize - actual_cost
+        total_hit = h2 + h3 if sub == "3中2" else hn
+        results.append({"期号": row['期号'], "开奖日期": row['开奖日期'], "正码": row['正码'], "特码": draw_special, "命中注数": total_hit, "本期盈亏": round(pl, 2)})
+        
+    res_df = pd.DataFrame(results)
+    if not res_df.empty: res_df['累计盈亏'] = res_df['本期盈亏'].cumsum()
+    return res_df
+
+# ================= 5. 测算结果展示 =================
+if not active_schemes:
+    st.info("👈 请在左侧勾选至少一个方案以展示测算结果。")
+else:
+    df_filtered = df_all[(df_all["日期_only"] >= start_date) & (df_all["日期_only"] <= end_date)].copy()
+    if df_filtered.empty:
+        st.warning("⚠️ 当前日期范围内云端没有数据！请调整左侧时间范围。")
+        st.stop()
+        
+    df_filtered["正码"], df_filtered["特码"] = zip(*df_filtered.apply(parse_draw, axis=1))
+    
+    all_res_dfs = []
+    for scheme in active_schemes:
+        res = calculate_scheme(df_filtered, scheme, time_filter)
+        if not res.empty:
+            res['方案名称'] = scheme['name']
+            all_res_dfs.append(res)
+            
+    if not all_res_dfs:
+        st.warning("当前过滤条件下无数据。")
+        st.stop()
+        
+    combined_df = pd.concat(all_res_dfs)
+    merged_pl = combined_df.groupby(['期号', '开奖日期']).agg({'命中注数': 'sum', '本期盈亏': 'sum'}).reset_index()
+    merged_pl['累计盈亏'] = merged_pl['本期盈亏'].cumsum()
+    total_combined_pl = merged_pl['本期盈亏'].sum()
+    
+    peak_value = merged_pl['累计盈亏'].max()
+    peak_issue = merged_pl.loc[merged_pl['累计盈亏'].idxmax(), '期号']
+    low_peak_value = merged_pl['累计盈亏'].min()
+    low_peak_issue = merged_pl.loc[merged_pl['累计盈亏'].idxmin(), '期号']
+    
+    alert_pos_triggered = peak_value >= st.session_state.pos_alert
+    alert_neg_triggered = low_peak_value <= st.session_state.neg_alert
+    
+    if alert_pos_triggered or alert_neg_triggered:
+        play_beep_sound()
+        if alert_pos_triggered and alert_neg_triggered:
+            st.error(f"🚨 **极度波动报警！** 触发正峰值线 (最高: ¥{peak_value:,.2f}) 且 触发负峰值线 (最低: ¥{low_peak_value:,.2f})。")
+        elif alert_pos_triggered:
+            st.success(f"🎉 **止盈报警！** 突破正峰值报警线！最高盈亏达到 ¥{peak_value:,.2f} (设定线: ¥{st.session_state.pos_alert:,.2f})")
+        elif alert_neg_triggered:
+            st.warning(f"⚠️ **止损报警！** 跌破负峰值报警线！最低盈亏达到 ¥{low_peak_value:,.2f} (设定线: ¥{st.session_state.neg_alert:,.2f})")
+
+    active_groups = set([s.get('group_name','').strip() for s in active_schemes if s.get('group_name','').strip()])
+    combined_names = list(active_groups)[0] if active_groups and len(active_groups) == 1 else " + ".join([s['name'] for s in active_schemes])
+    
+    st.markdown(f"<div style='font-size:16px; font-weight:bold; margin-bottom:5px;'>💰 合并总盈亏 ({combined_names})</div>", unsafe_allow_html=True)
+    
+    c_mid, c_right = st.columns([1.5, 3])
+    with c_mid:
+        st.markdown(f"""
+        <div class="custom-card" style="border-left: 4px solid {'#22C55E' if total_combined_pl >= 0 else '#EF4444'}; display: flex; flex-direction: column; justify-content: center; height: 100%;">
+            <div class="text-gray">合计盈亏 (元)</div>
+            <div class="huge-number {'profit' if total_combined_pl >= 0 else 'loss'}">¥ {total_combined_pl:,.2f}</div>
+            <div class="peak-text-pos">📈 最高: ¥ {peak_value:,.2f} <span style="color:#A3A3A3;font-weight:normal;">({peak_issue}期)</span></div>
+            <div class="peak-text-neg">📉 最低: ¥ {low_peak_value:,.2f} <span style="color:#A3A3A3;font-weight:normal;">({low_peak_issue}期)</span></div>
+        </div>
+        """, unsafe_allow_html=True)
+    
+    with c_right:
+        fig_combined = px.line(merged_pl, x="期号", y="累计盈亏", markers=True, template="plotly_dark")
+        fig_combined.update_layout(
+            plot_bgcolor='rgba(0,0,0,0)', paper_bgcolor='rgba(0,0,0,0)', 
+            height=st.session_state.chart_height, margin=dict(l=10, r=10, t=25, b=5), 
+            title=dict(text="合并总盈亏走势", font=dict(size=12, color="#A3A3A3")), yaxis=dict(dtick=10000)
+        )
+        fig_combined.add_scatter(x=[peak_issue], y=[peak_value], mode='markers+text', text=[f"最高: {peak_value:,.0f}"], textposition="top center", marker=dict(size=8, color='#22C55E', symbol='star'), textfont=dict(color='#22C55E', size=10))
+        fig_combined.add_scatter(x=[low_peak_issue], y=[low_peak_value], mode='markers+text', text=[f"最低: {low_peak_value:,.0f}"], textposition="bottom center", marker=dict(size=8, color='#EF4444', symbol='star'), textfont=dict(color='#EF4444', size=10))
+        fig_combined.update_traces(selector=dict(type='scatter', mode='lines+markers'), line_color='#38BDF8', line_width=2, marker=dict(size=5, color='#38BDF8'))
+        st.plotly_chart(fig_combined, use_container_width=True, key="chart_combined")
+
+    with st.expander("📋 查看合并每日明细记录", expanded=False):
+        st.dataframe(merged_pl, use_container_width=True, hide_index=True, height=200)
+    
+    st.markdown("---")
+    st.markdown("<div style='font-size:16px; font-weight:bold; margin-bottom:5px;'>🔍 各方案独立明细</div>", unsafe_allow_html=True)
+    
+    tabs = st.tabs([s['name'] for s in active_schemes])
+    for idx, scheme in enumerate(active_schemes):
+        with tabs[idx]:
+            res_df = calculate_scheme(df_filtered, scheme, time_filter)
+            if res_df.empty: continue
+            
+            total_pl = res_df['本期盈亏'].sum()
+            win_periods = len(res_df[res_df['命中注数'] > 0])
+            win_rate = (win_periods / len(res_df) * 100) if len(res_df) > 0 else 0
+            
+            s_peak_value = res_df['累计盈亏'].max()
+            s_peak_issue = res_df.loc[res_df['累计盈亏'].idxmax(), '期号']
+            s_low_peak_value = res_df['累计盈亏'].min()
+            s_low_peak_issue = res_df.loc[res_df['累计盈亏'].idxmin(), '期号']
+            
+            col_res_left, col_res_right = st.columns([1.5, 3])
+            with col_res_left:
+                st.markdown(f"""
+                <div class="custom-card" style="border-left: 4px solid {'#22C55E' if total_pl >= 0 else '#EF4444'};">
+                    <div class="text-gray">累计盈亏 (元)</div>
+                    <div class="huge-number {'profit' if total_pl >= 0 else 'loss'}">¥ {total_pl:,.2f}</div>
+                    <div class="peak-text-pos">📈 最高: ¥ {s_peak_value:,.2f} <span style="color:#A3A3A3;font-weight:normal;">({s_peak_issue}期)</span></div>
+                    <div class="peak-text-neg">📉 最低: ¥ {s_low_peak_value:,.2f} <span style="color:#A3A3A3;font-weight:normal;">({s_low_peak_issue}期)</span></div>
+                </div>
+                <div class="custom-card" style="margin-top:5px;">
+                    <div class="text-gray">胜率</div>
+                    <div class="huge-number" style="color: #FFF;">{win_rate:.1f}%</div>
+                    <div class="text-gray" style="margin-top:2px;">命中 {win_periods} / 总 {len(res_df)} 期</div>
+                </div>
+                """, unsafe_allow_html=True)
+            
+            with col_res_right:
+                fig = px.line(res_df, x="期号", y="累计盈亏", markers=True, template="plotly_dark")
+                fig.update_layout(
+                    plot_bgcolor='rgba(0,0,0,0)', paper_bgcolor='rgba(0,0,0,0)', 
+                    height=st.session_state.chart_height + 30, margin=dict(l=10, r=10, t=25, b=5), 
+                    title=dict(text="单方案盈亏走势", font=dict(size=12, color="#A3A3A3")), yaxis=dict(dtick=10000)
+                )
+                fig.add_scatter(x=[s_peak_issue], y=[s_peak_value], mode='markers+text', text=[f"最高: {s_peak_value:,.0f}"], textposition="top center", marker=dict(size=8, color='#22C55E', symbol='star'), textfont=dict(color='#22C55E', size=10))
+                fig.add_scatter(x=[s_low_peak_issue], y=[s_low_peak_value], mode='markers+text', text=[f"最低: {s_low_peak_value:,.0f}"], textposition="bottom center", marker=dict(size=8, color='#EF4444', symbol='star'), textfont=dict(color='#EF4444', size=10))
+                fig.update_traces(selector=dict(type='scatter', mode='lines+markers'), line_color='#22C55E', line_width=2)
+                st.plotly_chart(fig, use_container_width=True, key=f"chart_{scheme['id']}")
