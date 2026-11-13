@@ -103,7 +103,7 @@ def play_beep_sound():
     """
     components.html(js, height=0, width=0)
 
-# ================= 🔄 实时数据更新逻辑 (完全还原本地) =================
+# ================= 🔄 数据更新逻辑 (全量扫描+真实时间) =================
 LOTTERY_MAP = {
     "香港六合彩": {"code": "HK6", "type": "dpc"},
     "快乐8六合彩": {"code": "KLLHC", "type": "dpc"},
@@ -115,9 +115,9 @@ def update_latest_data(lottery_name, status_container=None):
     config = LOTTERY_MAP.get(lottery_name)
     if not config: return False, "未知彩种"
     
-    # 💡 使用真实的当前日期，如果系统时间错乱，去检查服务器/本地时间
+    # 💡 强行抓取 2026年1月1日 到 今天 的所有数据（六合彩一年才一百多期，抓取极快）
     today = datetime.today()
-    start_date = today.date() - timedelta(days=30)
+    start_date = datetime(2026, 1, 1).date()
     end_date = today.date()
     
     all_new_data = []
@@ -130,7 +130,7 @@ def update_latest_data(lottery_name, status_container=None):
     delta_days = (end_date - start_date).days + 1
     debug_msgs = []
 
-    if status_container: status_container.info(f"正在请求 {start_date} 至 {end_date} 的数据...")
+    if status_container: status_container.info(f"正在请求 2026-01-01 至 {end_date} 的历史数据...")
 
     for day_offset in range(delta_days):
         target_date = start_date + timedelta(days=day_offset)
@@ -155,14 +155,14 @@ def update_latest_data(lottery_name, status_container=None):
             else:
                 debug_msgs.append(f"[{y}-{m}-{d}] HTTP {res.status_code}")
         except Exception as e:
-            debug_msgs.append(f"[{y}-{m}-{d}] 异常: {str(e)[:15]}")
+            debug_msgs.append(f"[{y}-{m}-{d}] 异常")
             
-        time.sleep(0.1) 
+        time.sleep(0.05) 
 
     if not all_new_data: 
         if debug_msgs:
             return False, f"⚠️ 接口请求失败: {', '.join(debug_msgs[:2])}..."
-        return False, "⚠️ 接口未返回任何数据 (可能是IP被拦或确实没开奖)"
+        return False, "⚠️ 接口未返回任何数据"
 
     df_new = pd.DataFrame(all_new_data)
     df_new['issue'] = df_new['issue'].astype(str).str.strip()
@@ -175,10 +175,12 @@ def update_latest_data(lottery_name, status_container=None):
         df_new = df_new[~df_new['issue'].isin(existing_issues)]
         
         if df_new.empty:
-            return False, f"已是最新 (抓到了{len(all_new_data)}条，均存在。首条抓取时间: {all_new_data[0]['draw_time']})"
+            # 找到了多少条，最新日期是几号
+            newest_time = pd.to_datetime(all_new_data[-1]['draw_time']).strftime('%Y-%m-%d') if all_new_data else "未知"
+            return False, f"已是最新 (全库无缺失。当前官网最新数据截止: {newest_time})"
             
         df_new.to_sql('lottery_data', engine, if_exists='append', index=False)
-        return True, f"✅ 成功补齐 {len(df_new)} 条新开奖！最新一期：{df_new.iloc[-1]['issue']}"
+        return True, f"✅ 成功补齐 {len(df_new)} 条新开奖！最新一期：{df_new.iloc[-1]['issue']} ({df_new.iloc[-1]['draw_time'].strftime('%Y-%m-%d')})"
     except Exception as e:
         return False, f"❌ 写入数据库失败: {e}"
 
@@ -233,13 +235,14 @@ st.sidebar.markdown("**📅 快捷时间**")
 btn_col1, btn_col2, btn_col3 = st.sidebar.columns(3)
 today = datetime.today().date()
 yesterday = today - timedelta(days=1)
-week_start = today - timedelta(days=today.weekday())
+month_start = today - timedelta(days=30)
 
 if btn_col1.button("今天", use_container_width=True): st.session_state.date_range = (today, today)
-if btn_col2.button("昨天", use_container_width=True): st.session_state.date_range = (yesterday, yesterday)
-if btn_col3.button("本周", use_container_width=True): st.session_state.date_range = (week_start, today)
+if btn_col2.button("近30天", use_container_width=True): st.session_state.date_range = (month_start, today)
+if btn_col3.button("本年", use_container_width=True): st.session_state.date_range = (datetime(2026,1,1).date(), today)
 
-if 'date_range' not in st.session_state: st.session_state.date_range = (today, today)
+# 💡 默认时间范围改为最近30天，确保你一打开就能看到最新的数据
+if 'date_range' not in st.session_state: st.session_state.date_range = (month_start, today)
 start_date = st.sidebar.date_input("开始日期", value=st.session_state.date_range[0])
 end_date = st.sidebar.date_input("结束日期", value=st.session_state.date_range[1])
 
@@ -424,7 +427,7 @@ with st.expander("🔄 数据更新", expanded=True):
             else: st.error(msg, icon="❌")
             st.session_state.update_msg = None
         else:
-            st.info("每次点击将强制扫描最近 30 天的数据。")
+            st.info("每次点击将从2026年1月1日全量扫描至今。")
 
 if is_high_freq:
     with st.expander("⚙️ 报警线设置与图表调节", expanded=False):
