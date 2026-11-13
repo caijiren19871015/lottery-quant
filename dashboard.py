@@ -19,34 +19,18 @@ st.set_page_config(page_title="数据量化终端", layout="wide", page_icon="�
 st.markdown("""
     <style>
     header[data-testid="stHeader"] { display: none !important; }
-    .block-container { 
-        padding-top: 0.5rem !important; padding-bottom: 0.5rem !important; 
-        padding-left: 1rem !important; padding-right: 1rem !important;
-    }
+    .block-container { padding-top: 0.5rem !important; padding-bottom: 0.5rem !important; padding-left: 1rem !important; padding-right: 1rem !important; }
     .stApp { background-color: #0A0A0A; color: #E5E5E5; }
-    
-    .custom-card {
-        background-color: #121212; border: 1px solid #262626;
-        border-radius: 6px; padding: 15px; margin-bottom: 10px;
-        box-shadow: 0 4px 6px rgba(0,0,0,0.3);
-    }
-    
+    .custom-card { background-color: #121212; border: 1px solid #262626; border-radius: 6px; padding: 15px; margin-bottom: 10px; box-shadow: 0 4px 6px rgba(0,0,0,0.3); }
     h1, h2, h3 { color: #FFFFFF !important; font-family: -apple-system, sans-serif; margin-bottom: 0px !important; }
     label { color: #A3A3A3 !important; font-size: 12px !important; padding-bottom: 0px !important; }
-    
     [data-testid="stSidebar"] { background-color: #0F0F0F; border-right: 1px solid #262626; }
-    
     .ball-container { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
-    .ball {
-        display: inline-flex; align-items: center; justify-content: center;
-        width: 32px; height: 32px; border-radius: 50%;
-        font-weight: bold; font-size: 14px; box-shadow: 0 2px 4px rgba(0,0,0,0.3);
-    }
+    .ball { display: inline-flex; align-items: center; justify-content: center; width: 32px; height: 32px; border-radius: 50%; font-weight: bold; font-size: 14px; box-shadow: 0 2px 4px rgba(0,0,0,0.3); }
     .ball-red { background-color: #7F1D1D; color: #FCA5A5; border: 1px solid #EF4444; }
     .ball-blue { background-color: #1E3A8A; color: #93C5FD; border: 1px solid #3B82F6; }
     .ball-green { background-color: #14532D; color: #86EFAC; border: 1px solid #22C55E; }
     .ball-special { box-shadow: 0 0 8px 1px rgba(255, 255, 255, 0.4); transform: scale(1.05); font-weight: 900; }
-    
     .huge-number { font-size: 36px; font-weight: 800; line-height: 1.1; }
     .profit { color: #22C55E; }
     .loss { color: #EF4444; }
@@ -98,7 +82,7 @@ def play_beep_sound():
     """
     components.html(js, height=0, width=0)
 
-# ================= 🔄 自动补齐逻辑 =================
+# ================= 🔄 数据同步逻辑 =================
 LOTTERY_MAP = {
     "香港六合彩": {"code": "HK6", "type": "dpc"},
     "快乐8六合彩": {"code": "KLLHC", "type": "dpc"},
@@ -118,8 +102,7 @@ def auto_sync_data(lottery_name):
     if start_date > end_date: return False
     
     delta_days = (end_date - start_date).days + 1
-    if delta_days > 30:
-        start_date, delta_days = end_date - timedelta(days=30), 31
+    if delta_days > 30: start_date, delta_days = end_date - timedelta(days=30), 31
         
     all_new_data = []
     headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://166w2.com/"}
@@ -161,31 +144,44 @@ def auto_sync_data(lottery_name):
     except Exception: pass
     return False
 
-# ================= 💾 方案云端保存 =================
+# ================= 💾 方案云端保存 (加固版) =================
 def save_scheme_to_db(scheme):
     try:
         df = pd.DataFrame([{"id": scheme["id"], "scheme_json": json.dumps(scheme)}])
         with engine.begin() as conn:
             conn.execute(text("DELETE FROM saved_schemes WHERE id = :id"), {"id": scheme["id"]})
             df.to_sql('saved_schemes', engine, if_exists='append', index=False)
-    except Exception as e: st.error(f"方案保存云端失败: {e}")
+        # 💡 给个提示
+        st.toast(f"方案 '{scheme['name']}' 已保存至云端", icon="✅")
+    except Exception as e: 
+        st.error(f"方案保存云端失败 (请检查Supabase连接): {e}")
 
 def delete_scheme_from_db(scheme_id):
     try:
         with engine.begin() as conn:
             conn.execute(text("DELETE FROM saved_schemes WHERE id = :id"), {"id": scheme_id})
-    except Exception as e: st.error(f"方案删除失败: {e}")
+        st.toast("方案已从云端删除", icon="🗑️")
+    except Exception as e: 
+        st.error(f"方案删除失败: {e}")
 
 def load_schemes():
     try:
         df = pd.read_sql("SELECT scheme_json FROM saved_schemes", engine)
+        # 如果表为空，返回空列表
+        if df.empty: return []
         return [json.loads(row) for row in df['scheme_json']]
-    except: return []
+    except Exception as e:
+        # 💡 致命错误暴露：如果数据库连不上，不要默默吃掉错误
+        st.error(f"🚨 读取方案失败，请检查云端数据库连接！ {e}")
+        return []
 
-if 'schemes' not in st.session_state: st.session_state.schemes = load_schemes() 
-if 'editing_id' not in st.session_state: st.session_state.editing_id = None
+# 💡 页面的初始化状态
+if 'schemes' not in st.session_state: 
+    st.session_state.schemes = load_schemes() 
+if 'editing_id' not in st.session_state: 
+    st.session_state.editing_id = None
 
-# 💡 URL 记忆
+# URL 记忆
 if "chart_height" not in st.session_state: st.session_state.chart_height = int(st.query_params.get("chart_height", 350))
 if "dtick_val" not in st.session_state: st.session_state.dtick_val = int(st.query_params.get("dtick_val", 10000))
 if "pos_alert" not in st.session_state: st.session_state.pos_alert = float(st.query_params.get("pos_alert", 10000.0))
@@ -304,6 +300,7 @@ with st.sidebar.expander(form_title, expanded=is_editing):
                 st.session_state.editing_id = None
             else:
                 st.session_state.schemes.append(new_scheme)
+            
             save_scheme_to_db(new_scheme) 
             st.rerun()
         except Exception as e: 
@@ -398,7 +395,6 @@ if not df_all.empty:
         </div>
         """, unsafe_allow_html=True)
 
-# 💡 这里是修改后的报警线设置与图表调节面板
 with st.expander("报警线设置与图表调节", expanded=False):
     c_alert1, c_alert2 = st.columns(2)
     with c_alert1: st.number_input("正峰值报警线 (元) - 止盈", step=1000.0, key="pos_alert", on_change=sync_alerts_to_url)
@@ -561,7 +557,7 @@ else:
             plot_bgcolor='rgba(0,0,0,0)', paper_bgcolor='rgba(0,0,0,0)', 
             height=st.session_state.chart_height, margin=dict(l=10, r=10, t=25, b=5), 
             title=dict(text="合并总盈亏走势", font=dict(size=12, color="#A3A3A3")), 
-            yaxis=dict(dtick=st.session_state.dtick_val) # 💡 应用动态单位
+            yaxis=dict(dtick=st.session_state.dtick_val)
         )
         fig_combined.add_scatter(x=[peak_issue], y=[peak_value], mode='markers+text', text=[f"最高: {peak_value:,.0f}"], textposition="top center", marker=dict(size=8, color='#22C55E', symbol='star'), textfont=dict(color='#22C55E', size=10))
         fig_combined.add_scatter(x=[low_peak_issue], y=[low_peak_value], mode='markers+text', text=[f"最低: {low_peak_value:,.0f}"], textposition="bottom center", marker=dict(size=8, color='#EF4444', symbol='star'), textfont=dict(color='#EF4444', size=10))
@@ -611,7 +607,7 @@ else:
                     plot_bgcolor='rgba(0,0,0,0)', paper_bgcolor='rgba(0,0,0,0)', 
                     height=st.session_state.chart_height + 30, margin=dict(l=10, r=10, t=25, b=5), 
                     title=dict(text="单方案盈亏走势", font=dict(size=12, color="#A3A3A3")), 
-                    yaxis=dict(dtick=st.session_state.dtick_val) # 💡 应用动态单位
+                    yaxis=dict(dtick=st.session_state.dtick_val)
                 )
                 fig.add_scatter(x=[s_peak_issue], y=[s_peak_value], mode='markers+text', text=[f"最高: {s_peak_value:,.0f}"], textposition="top center", marker=dict(size=8, color='#22C55E', symbol='star'), textfont=dict(color='#22C55E', size=10))
                 fig.add_scatter(x=[s_low_peak_issue], y=[s_low_peak_value], mode='markers+text', text=[f"最低: {s_low_peak_value:,.0f}"], textposition="bottom center", marker=dict(size=8, color='#EF4444', symbol='star'), textfont=dict(color='#EF4444', size=10))
