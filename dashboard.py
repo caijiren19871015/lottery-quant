@@ -24,21 +24,17 @@ st.markdown("""
     div[data-testid="stVerticalBlock"] { gap: 0.5rem !important; }
     .stApp { background-color: #0A0A0A; color: #E5E5E5; }
     
-    /* 卡片样式 */
     .custom-card {
         background-color: #121212; border: 1px solid #262626;
         border-radius: 6px; padding: 15px; margin-bottom: 10px;
         box-shadow: 0 4px 6px rgba(0,0,0,0.3);
     }
     
-    /* 标题与标签 */
     h1, h2, h3 { color: #FFFFFF !important; font-family: -apple-system, sans-serif; margin-bottom: 0px !important; }
     label { color: #A3A3A3 !important; font-size: 12px !important; padding-bottom: 0px !important; }
     
-    /* 侧边栏 */
     [data-testid="stSidebar"] { background-color: #0F0F0F; border-right: 1px solid #262626; }
     
-    /* 开奖球（波色） */
     .ball-container { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
     .ball {
         display: inline-flex; align-items: center; justify-content: center;
@@ -50,7 +46,6 @@ st.markdown("""
     .ball-green { background-color: #14532D; color: #86EFAC; border: 1px solid #22C55E; }
     .ball-special { box-shadow: 0 0 8px 1px rgba(255, 255, 255, 0.4); transform: scale(1.05); font-weight: 900; }
     
-    /* 核心数据大数字 */
     .huge-number { font-size: 36px; font-weight: 800; line-height: 1.1; }
     .profit { color: #22C55E; }
     .loss { color: #EF4444; }
@@ -111,25 +106,23 @@ LOTTERY_MAP = {
 }
 
 def auto_sync_data(lottery_name):
-    """智能同步：只抓缺失的天数，避免全量扫描卡死"""
     config = LOTTERY_MAP.get(lottery_name)
-    if not config: return False, "未知彩种"
+    if not config: return False
     
     end_date = datetime.today().date()
     try:
         df_old = pd.read_sql(f"SELECT draw_time FROM lottery_data WHERE lottery_name = '{lottery_name}' ORDER BY draw_time DESC LIMIT 1", engine)
         if df_old.empty:
-            start_date = end_date - timedelta(days=3) # 空表默认抓3天
+            start_date = end_date - timedelta(days=3)
         else:
             max_date = pd.to_datetime(df_old.iloc[0]['draw_time']).date()
             start_date = max_date
     except Exception:
-        return False, "数据库连接异常"
+        return False
 
-    if start_date > end_date: return False, "无断层"
+    if start_date > end_date: return False
     
     delta_days = (end_date - start_date).days + 1
-    # 如果断层太久（超过30天），为了防封禁，最多只抓30天
     if delta_days > 30:
         start_date = end_date - timedelta(days=30)
         delta_days = 31
@@ -161,7 +154,7 @@ def auto_sync_data(lottery_name):
                 except Exception: pass
                 time.sleep(0.01)
 
-    if not all_new_data: return False, "无新数据"
+    if not all_new_data: return False
     
     df_new = pd.DataFrame(all_new_data)
     df_new['issue'] = df_new['issue'].astype(str).str.strip()
@@ -174,10 +167,10 @@ def auto_sync_data(lottery_name):
         
         if not df_new.empty:
             df_new.to_sql('lottery_data', engine, if_exists='append', index=False)
-            return True, f"成功补齐 {len(df_new)} 期"
+            return True
     except Exception:
         pass
-    return False, "无新数据"
+    return False
 
 # ================= 💾 方案云端保存逻辑 =================
 def save_scheme_to_db(scheme):
@@ -203,16 +196,14 @@ def load_schemes():
     except:
         return []
 
+# 💡 每次加载页面，都从数据库实时拉取最新方案
 if 'schemes' not in st.session_state: st.session_state.schemes = load_schemes() 
 if 'editing_id' not in st.session_state: st.session_state.editing_id = None
 
+# 💡 URL 状态记忆（解决刷新丢失问题）
 if "chart_height" not in st.session_state: st.session_state.chart_height = int(st.query_params.get("chart_height", 350))
 if "pos_alert" not in st.session_state: st.session_state.pos_alert = float(st.query_params.get("pos_alert", 10000.0))
 if "neg_alert" not in st.session_state: st.session_state.neg_alert = float(st.query_params.get("neg_alert", -5000.0))
-if "auto_sync" not in st.session_state: st.session_state.auto_sync = st.query_params.get("auto_sync") == "true"
-if "auto_interval" not in st.session_state:
-    try: st.session_state.auto_interval = int(st.query_params.get("auto_interval", 60))
-    except ValueError: st.session_state.auto_interval = 60
 
 def sync_alerts_to_url():
     st.query_params["pos_alert"] = str(st.session_state.pos_alert)
@@ -342,7 +333,7 @@ def render_scheme_row(s):
     is_active = c1.checkbox(s['name'], value=s['active'], key=f"chk_{s['id']}")
     if is_active != s['active']: 
         s['active'] = is_active
-        save_scheme_to_db(s) 
+        save_scheme_to_db(s) # 💡 核心修复：勾选状态立刻存库，刷新不丢
     if c2.button("改", key=f"e_{s['id']}"): st.session_state.editing_id = s['id']; st.rerun()
     if c3.button("删", key=f"d_{s['id']}"):
         st.session_state.schemes = [x for x in st.session_state.schemes if x['id'] != s['id']]
@@ -366,7 +357,7 @@ if st.session_state.schemes:
                 if new_group_active != group_active:
                     for s in s_list: 
                         s['active'] = new_group_active
-                        save_scheme_to_db(s)
+                        save_scheme_to_db(s) # 💡 核心修复
                     st.rerun()
                 with st.expander(f"🔽 查看 {g_name} 内的 {len(s_list)} 个方案", expanded=False):
                     for s in s_list: render_scheme_row(s)
@@ -377,14 +368,13 @@ st.markdown(f"<h2 style='font-size: 20px; display:inline-block;'>📊 历史盈�
 c_lottery, c_action = st.columns([1.5, 2.5])
 with c_lottery:
     selected_lottery = st.selectbox("🎯 目标彩种", available_lotteries)
+    st.query_params["lottery"] = selected_lottery # 💡 记忆选中的彩种
     
     is_high_freq = ("宾果" in selected_lottery or "加拿大" in selected_lottery)
     
-    # 💡 核心优化：如果发现不是今天，才去同步数据。避免每次刷新都卡半天。
     cache_key = f"synced_{selected_lottery}"
     if cache_key not in st.session_state:
-        with st.spinner("同步今日最新数据..."):
-            auto_sync_data(selected_lottery)
+        auto_sync_data(selected_lottery)
         st.session_state[cache_key] = True
 
     try:
@@ -400,27 +390,10 @@ with c_lottery:
 with c_action:
     st.markdown("<div style='margin-top: 10px;'></div>", unsafe_allow_html=True)
     if is_high_freq:
-        if not st.session_state.auto_sync:
-            if st.button("▶️ 开启自动页面刷新 (每60秒)", use_container_width=True, type="primary"):
-                st.session_state.auto_sync = True
-                st.query_params["auto_sync"] = "true"
-                st.rerun()
-        else:
-            if st.button("⏸️ 暂停自动刷新", use_container_width=True):
-                st.session_state.auto_sync = False
-                if "auto_sync" in st.query_params: del st.query_params["auto_sync"]
-                st.rerun()
-
-# 💡 JS 定时刷新（仅在开启自动刷新且为高频彩时生效）
-if st.session_state.auto_sync and is_high_freq:
-    js = f"""
-    <script>
-    setTimeout(function(){{
-        window.parent.location.reload();
-    }}, {st.session_state.auto_interval * 1000});
-    </script>
-    """
-    components.html(js, height=0, width=0)
+        # 💡 自动刷新模块
+        if st.button("⚡ 极速刷新最新数据 (并刷新图表)", use_container_width=True, type="primary"):
+            auto_sync_data(selected_lottery)
+            st.rerun()
 
 if not df_all.empty:
     latest_row = df_all.iloc[-1]
@@ -436,6 +409,17 @@ if not df_all.empty:
             <div class="ball-container">{balls_html}</div>
         </div>
         """, unsafe_allow_html=True)
+
+# 💡 报警阈值设置区
+with st.expander("⚙️ 报警线设置与图表调节", expanded=False):
+    c_alert1, c_alert2 = st.columns(2)
+    with c_alert1: st.number_input("📈 正峰值报警线 (元) - 止盈", step=1000.0, key="pos_alert", on_change=sync_alerts_to_url)
+    with c_alert2: st.number_input("📉 负峰值报警线 (元) - 止损", step=-1000.0, key="neg_alert", on_change=sync_alerts_to_url)
+    new_height = st.slider("图表高度", min_value=250, max_value=900, value=st.session_state.chart_height, step=50)
+    if new_height != st.session_state.chart_height:
+        st.session_state.chart_height = new_height
+        st.query_params["chart_height"] = str(new_height)
+        st.rerun()
 
 # ================= 4. 计算引擎 =================
 def calculate_scheme(df, scheme, time_filter=""):
@@ -548,6 +532,7 @@ else:
     alert_pos_triggered = peak_value >= st.session_state.pos_alert
     alert_neg_triggered = low_peak_value <= st.session_state.neg_alert
     
+    # 💡 触发语音和弹窗报警
     if alert_pos_triggered or alert_neg_triggered:
         play_beep_sound()
         if alert_pos_triggered and alert_neg_triggered:
