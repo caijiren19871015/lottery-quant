@@ -104,10 +104,10 @@ def play_beep_sound():
     """
     components.html(js, height=0, width=0)
 
-# ================= 🔄 数据抓取逻辑 =================
+# ================= 🔄 数据抓取逻辑 (完全还原旧代码) =================
 LOTTERY_MAP = {
-    "香港六合彩": {"code": "HK6", "type": "dpc", "draw_hour": 21},
-    "快乐8六合彩": {"code": "KLLHC", "type": "dpc", "draw_hour": 21},
+    "香港六合彩": {"code": "HK6", "type": "dpc"},
+    "快乐8六合彩": {"code": "KLLHC", "type": "dpc"},
     "宾果六合彩": {"code": "TWBGLHC", "type": "gpc"},
     "加拿大六合彩": {"code": "JNDLHC", "type": "gpc"}
 }
@@ -128,7 +128,6 @@ def update_latest_data(lottery_name, status_container=None):
     try:
         df_old = pd.read_sql(f"SELECT issue, draw_time FROM lottery_data WHERE lottery_name = '{lottery_name}' ORDER BY draw_time DESC LIMIT 1", engine)
         if df_old.empty:
-            # 如果是空表，首次建仓，抓最近 30 天
             start_date = datetime.today().date() - timedelta(days=30) 
         else:
             max_date = pd.to_datetime(df_old.iloc[0]['draw_time']).date()
@@ -140,27 +139,22 @@ def update_latest_data(lottery_name, status_container=None):
     if start_date > end_date: return False, "已是最新"
     
     all_new_data = []
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", "Referer": "https://166kai.com/"}
+    headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://166w2.com/"}
     delta_days = (end_date - start_date).days + 1
 
     if config["type"] == "dpc":
-        # 传统彩：按天循环（断档几天就循环几天）
+        # 💡 彻底还原旧代码：单线程，不补零，按天循环
+        if status_container: status_container.info("正在按天抓取传统彩数据...")
         for day_offset in range(delta_days):
             target_date = start_date + timedelta(days=day_offset)
             y, m, d = target_date.strftime("%Y"), target_date.month, target_date.day
-            url = f"https://api.api68.com/pks/getPksHistoryList.do?date={y}-{m:02d}-{d:02d}&lotCode={config['code']}"
+            url = f"https://data.kai8.us/api/lottery/history_dpc/KAI166/{config['code']}/{y}/{m}/{d}"
             records = fetch_api(url, headers)
-            if not records:
-                url2 = f"https://data.kai8.us/api/lottery/history_dpc/KAI166/{config['code']}/{y}/{m}/{d}"
-                records = fetch_api(url2, headers)
-            
             for item in records:
-                issue = str(item.get("preDrawIssue") or item.get("issue")).strip()
-                draw_time = item.get("preDrawTime") or item.get("draw_time")
-                draw_code = item.get("preDrawCode") or item.get("draw_code")
-                all_new_data.append({"lottery_name": lottery_name, "issue": issue, "draw_time": draw_time, "draw_code": draw_code})
+                all_new_data.append({"lottery_name": lottery_name, "issue": str(item.get("issue")).strip(), "draw_time": item.get("draw_time"), "draw_code": item.get("draw_code")})
+            time.sleep(0.1) # 稍作延迟，防止被封
     else:
-        # 高频彩：按小时并发循环
+        # 高频彩：保留并发极速抓取
         if status_container: status_container.info("正在通过高频通道极速抓取...")
         urls_to_fetch = []
         for day_offset in range(delta_days):
@@ -170,7 +164,7 @@ def update_latest_data(lottery_name, status_container=None):
                 url = f"https://data.kai8.us/api/lottery/history_gpc/KAI166/{config['code']}/{y}-{m:02d}-{d:02d}/{h}/30"
                 urls_to_fetch.append(url)
                 
-        with ThreadPoolExecutor(max_workers=15) as executor:
+        with ThreadPoolExecutor(max_workers=10) as executor:
             results = executor.map(lambda u: fetch_api(u, headers), urls_to_fetch)
             for records in results:
                 for item in records:
@@ -184,20 +178,21 @@ def update_latest_data(lottery_name, status_container=None):
     df_new = df_new.dropna(subset=['draw_time'])
     df_new = df_new.drop_duplicates(subset=['lottery_name', 'issue'], keep='first')
     
-    if df_new.empty: return False, "⚠️ 数据无效，已跳过。"
+    if df_new.empty: return False, "⚠️ 数据无效或已全部存在"
 
+    # 💡 还原旧代码思路：对比过滤，再写入
     if status_container: status_container.info(f"正在写入 {len(df_new)} 条数据...")
-    
     try:
-        records = df_new.to_dict('records')
-        sql = text("""
-            INSERT INTO lottery_data (lottery_name, issue, draw_time, draw_code)
-            VALUES (:lottery_name, :issue, :draw_time, :draw_code)
-            ON CONFLICT (lottery_name, issue) DO NOTHING
-        """)
-        with engine.begin() as conn:
-            conn.execute(sql, records)
-        return True, f"✅ 抓取完成！已同步至云端"
+        # 查出库里已有的期号
+        existing_issues = pd.read_sql(f"SELECT issue FROM lottery_data WHERE lottery_name = '{lottery_name}'", engine)['issue'].astype(str).str.strip().tolist()
+        # 过滤掉已有数据
+        df_new = df_new[~df_new['issue'].isin(existing_issues)]
+        
+        if df_new.empty:
+            return False, "已是最新 (无新数据)"
+            
+        df_new.to_sql('lottery_data', engine, if_exists='append', index=False)
+        return True, f"✅ 抓取完成！成功写入 {len(df_new)} 条新开奖"
     except Exception as e:
         return False, f"❌ 写入数据库失败: {e}"
 
@@ -400,28 +395,14 @@ with c_lottery:
     selected_lottery = st.selectbox("🎯 目标彩种", available_lotteries)
     is_high_freq = ("宾果" in selected_lottery or "加拿大" in selected_lottery)
     
-    # 💡 核心：判断是否触发自动抓取
-    now = datetime.now()
-    trigger_auto_fetch = False
-    
     if is_high_freq:
-        # 高频彩：只要间隔超过30秒就抓
-        if "last_checked" not in st.session_state or st.session_state.get("last_lottery") != selected_lottery or (now - st.session_state.last_checked).total_seconds() > 30:
-            trigger_auto_fetch = True
-    else:
-        # 传统彩 (香港/快乐8)：每天晚上 21:30 之后触发
-        draw_hour = LOTTERY_MAP[selected_lottery].get("draw_hour", 21)
-        if now.hour >= draw_hour or now.hour < 2: # 比如晚上21:30以后，或者凌晨(防止跨天没抓到)
-            if "last_checked" not in st.session_state or st.session_state.get("last_lottery") != selected_lottery or (now - st.session_state.last_checked).total_seconds() > 3600:
-                trigger_auto_fetch = True
-
-    if trigger_auto_fetch:
-        with st.spinner(f"正在自动补全 {selected_lottery} 数据..."):
-            success, msg = update_latest_data(selected_lottery, status_box)
-            st.session_state.last_checked = now
-            st.session_state.last_lottery = selected_lottery
-            if success: status_box.success(msg)
-            elif "已是最新" not in msg: status_box.warning(msg)
+        if "last_checked" not in st.session_state or st.session_state.get("last_lottery") != selected_lottery or (datetime.now() - st.session_state.last_checked).total_seconds() > 30:
+            with st.spinner("云端极速并发获取数据中..."):
+                success, msg = update_latest_data(selected_lottery, status_box)
+                st.session_state.last_checked = datetime.now()
+                st.session_state.last_lottery = selected_lottery
+                if success: status_box.success(msg)
+                else: status_box.warning(msg)
 
     try:
         query = f"SELECT issue as 期号, draw_time as 开奖日期, draw_code as 开奖号码 FROM lottery_data WHERE lottery_name = '{selected_lottery}'"
@@ -451,7 +432,6 @@ if not df_all.empty:
         </div>
         """, unsafe_allow_html=True)
 
-# 手动更新按钮区
 if not is_high_freq:
     with st.expander("🔄 传统彩数据更新 (香港/快乐8)", expanded=True):
         c_sync1, c_sync2 = st.columns([1.5, 3.5])
