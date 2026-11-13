@@ -419,12 +419,8 @@ with st.expander("报警线设置与图表调节", expanded=False):
             st.query_params["dtick_val"] = str(new_dtick)
             st.rerun()
 
-# 💡 核心优化：加入缓存机制，避免重复计算卡死页面
-@st.cache_data(show_spinner=False)
-def calculate_scheme(df_json, scheme_json, time_filter=""):
-    df = pd.read_json(df_json)
-    scheme = json.loads(scheme_json)
-    
+# 💡 移除 cache_data，直接计算
+def calculate_scheme(df, scheme, time_filter=""):
     cat, sub = scheme['category'], scheme['sub_type']
     if cat == "特码类": bet_count = len(scheme['numbers'])
     elif cat == "连码复式":
@@ -497,7 +493,7 @@ def calculate_scheme(df_json, scheme_json, time_filter=""):
         
     res_df = pd.DataFrame(results)
     if not res_df.empty: res_df['累计盈亏'] = res_df['本期盈亏'].cumsum()
-    return res_df.to_json()
+    return res_df
 
 # ================= 5. 测算结果展示 =================
 if not active_schemes:
@@ -510,9 +506,6 @@ else:
         
     df_filtered["正码"], df_filtered["特码"] = zip(*df_filtered.apply(parse_draw, axis=1))
     
-    # 将 DataFrame 转为 json 传给带缓存的函数
-    df_json = df_filtered.to_json()
-    
     # 💡 进度条初始化
     total_schemes = len(active_schemes)
     progress_text = "正在计算历史盈亏..."
@@ -522,15 +515,13 @@ else:
     all_res_dfs = []
     
     for i, scheme in enumerate(active_schemes):
-        scheme_json = json.dumps(scheme)
-        res_json = calculate_scheme(df_json, scheme_json, "")
-        res = pd.read_json(res_json)
+        # 直接计算，不传 json 字符串
+        res = calculate_scheme(df_filtered, scheme, "")
         
         scheme_results[scheme['id']] = res
         
         if not res.empty:
             res['方案名称'] = scheme['name']
-            res['开奖日期'] = pd.to_datetime(res['开奖日期'])
             all_res_dfs.append(res)
             
         # 💡 更新进度条
@@ -608,7 +599,6 @@ else:
     tabs = st.tabs([s['name'] for s in active_schemes])
     for idx, scheme in enumerate(active_schemes):
         with tabs[idx]:
-            # 💡 核心优化：这里直接从内存字典里取，绝不重复计算
             res_df = scheme_results.get(scheme['id'])
             if res_df is None or res_df.empty: continue
             
