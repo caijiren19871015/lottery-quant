@@ -256,7 +256,13 @@ with st.sidebar.expander(form_title, expanded=is_editing):
     elif category == "连码复式":
         sub_cat = st.selectbox("玩法细分", ["3中3", "3中2", "2中2", "特串"], index=["3中3", "3中2", "2中2", "特串"].index(def_sub) if def_sub in ["3中3", "3中2", "2中2", "特串"] else 0)
         numbers_str = st.text_input("号码池", value=def_nums)
-        numbers2_str = st.text_input("特码池", value=def_nums2) if sub_cat == "特串" else ""
+        
+        # 💡 修复：连码复式下的特串，取消了第二个特码池
+        if sub_cat == "特串":
+            numbers2_str = "" 
+        else:
+            numbers2_str = ""
+            
         if sub_cat == "3中2":
             col1, col2 = st.columns(2)
             with col1: odds_val_1 = st.number_input("中2个赔率", value=odds_val_1, step=1.0)
@@ -419,7 +425,6 @@ with st.expander("报警线设置与图表调节", expanded=False):
             st.query_params["dtick_val"] = str(new_dtick)
             st.rerun()
 
-# 💡 核心优化：加回 @st.cache_data，直接传 DataFrame（Streamlit 原生支持）
 @st.cache_data(show_spinner=False)
 def calculate_scheme_cached(df, scheme, time_filter=""):
     cat, sub = scheme['category'], scheme['sub_type']
@@ -428,7 +433,8 @@ def calculate_scheme_cached(df, scheme, time_filter=""):
         n = len(scheme['numbers'])
         if sub in ["3中3", "3中2"]: bet_count = len(list(itertools.combinations(range(n), 3)))
         elif sub == "2中2": bet_count = len(list(itertools.combinations(range(n), 2)))
-        else: bet_count = n * len(scheme['numbers2']) if scheme.get('numbers2') else n
+        # 💡 修复：连码复式 - 特串，按 C(n,2) 算注数
+        else: bet_count = len(list(itertools.combinations(range(n), 2)))
     else: 
         L, R = len(scheme['numbers']), len(scheme['numbers2'])
         if sub in ["2中2", "特串"]: bet_count = L * R
@@ -457,10 +463,12 @@ def calculate_scheme_cached(df, scheme, time_filter=""):
             elif sub == "2中2":
                 for grp in itertools.combinations(nums, 2):
                     if all(n in draw_normals for n in grp): hn += 1
+            # 💡 修复：连码复式 - 特串的判定逻辑
             elif sub == "特串":
-                for n in nums:
-                    for sp in scheme['numbers2']:
-                        if n in draw_normals and sp == draw_special: hn += 1
+                for grp in itertools.combinations(nums, 2):
+                    n1, n2 = grp
+                    if (n1 in draw_normals and n2 == draw_special) or (n2 in draw_normals and n1 == draw_special):
+                        hn += 1
         elif cat == "连码对碰":
             L_nums, R_nums = scheme['numbers'], scheme['numbers2']
             if sub == "2中2":
@@ -507,7 +515,7 @@ else:
         
     df_filtered["正码"], df_filtered["特码"] = zip(*df_filtered.apply(parse_draw, axis=1))
     
-    # 💡 进度条初始化（包含总天数提示）
+    # 进度条初始化
     total_schemes = len(active_schemes)
     total_days = len(df_filtered)
     progress_text = f"正在计算历史盈亏... (共 {total_days} 期数据)"
@@ -517,7 +525,6 @@ else:
     all_res_dfs = []
     
     for i, scheme in enumerate(active_schemes):
-        # 使用带缓存的函数，直接传 DataFrame
         res = calculate_scheme_cached(df_filtered, scheme, "")
         
         scheme_results[scheme['id']] = res
@@ -526,7 +533,7 @@ else:
             res['方案名称'] = scheme['name']
             all_res_dfs.append(res)
             
-        # 💡 更新进度条，显示当前方案名和完成天数
+        # 更新进度条
         pct = int((i + 1) / total_schemes * 100)
         my_bar.progress(
             (i + 1) / total_schemes, 
