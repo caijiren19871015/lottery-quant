@@ -7,35 +7,41 @@ import uuid
 import json
 import requests
 import time
+import re
 from datetime import datetime, timedelta
 import streamlit.components.v1 as components
 from sqlalchemy import create_engine, text
-from streamlit_autorefresh import st_autorefresh # 💡 引入自动刷新库
+from streamlit_autorefresh import st_autorefresh
 
-# ================= 🎨 页面配置与 UI CSS =================
+# ================= 🎨 页面配置与完美 UI CSS (恢复版) =================
 st.set_page_config(page_title="数据量化终端", layout="wide", page_icon="📊")
 
+# 强制让 Streamlit 使用暗色主题（部分环境会默认亮色）
 st.markdown("""
     <style>
+    /* 隐藏默认头部，设置全局底色 */
     header[data-testid="stHeader"] { display: none !important; }
     .block-container { 
         padding-top: 0.5rem !important; padding-bottom: 0.5rem !important; 
         padding-left: 1rem !important; padding-right: 1rem !important;
     }
-    div[data-testid="stVerticalBlock"] { gap: 0.5rem !important; }
     .stApp { background-color: #0A0A0A; color: #E5E5E5; }
     
+    /* 卡片样式 */
     .custom-card {
         background-color: #121212; border: 1px solid #262626;
         border-radius: 6px; padding: 15px; margin-bottom: 10px;
         box-shadow: 0 4px 6px rgba(0,0,0,0.3);
     }
     
+    /* 标题与标签 */
     h1, h2, h3 { color: #FFFFFF !important; font-family: -apple-system, sans-serif; margin-bottom: 0px !important; }
     label { color: #A3A3A3 !important; font-size: 12px !important; padding-bottom: 0px !important; }
     
+    /* 侧边栏 */
     [data-testid="stSidebar"] { background-color: #0F0F0F; border-right: 1px solid #262626; }
     
+    /* 💡 核心：开奖球（波色样式） */
     .ball-container { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
     .ball {
         display: inline-flex; align-items: center; justify-content: center;
@@ -47,6 +53,7 @@ st.markdown("""
     .ball-green { background-color: #14532D; color: #86EFAC; border: 1px solid #22C55E; }
     .ball-special { box-shadow: 0 0 8px 1px rgba(255, 255, 255, 0.4); transform: scale(1.05); font-weight: 900; }
     
+    /* 核心数据大数字 */
     .huge-number { font-size: 36px; font-weight: 800; line-height: 1.1; }
     .profit { color: #22C55E; }
     .loss { color: #EF4444; }
@@ -60,7 +67,8 @@ st.markdown("""
 try:
     DB_URL = st.secrets["DB_URL"]
 except:
-    DB_URL = "postgresql+psycopg2://postgres.ishhmayoclgbnwdwojim:你的真实密码@aws-0-ap-northeast-1.pooler.supabase.com:5432/postgres"
+    # ⚠️ 请确保这里是你正确的密码 PPOOIIpoipoi8899
+    DB_URL = "postgresql+psycopg2://postgres.ishhmayoclgbnwdwojim:PPOOIIpoipoi8899@aws-0-ap-northeast-1.pooler.supabase.com:5432/postgres"
 
 @st.cache_resource
 def get_db_engine():
@@ -109,32 +117,23 @@ LOTTERY_MAP = {
 def auto_sync_data(lottery_name):
     config = LOTTERY_MAP.get(lottery_name)
     if not config: return False
-    
     end_date = datetime.today().date()
     try:
         df_old = pd.read_sql(f"SELECT draw_time FROM lottery_data WHERE lottery_name = '{lottery_name}' ORDER BY draw_time DESC LIMIT 1", engine)
-        if df_old.empty:
-            start_date = end_date - timedelta(days=3)
-        else:
-            max_date = pd.to_datetime(df_old.iloc[0]['draw_time']).date()
-            start_date = max_date
-    except Exception:
-        return False
+        start_date = end_date - timedelta(days=3) if df_old.empty else pd.to_datetime(df_old.iloc[0]['draw_time']).date()
+    except Exception: return False
 
     if start_date > end_date: return False
     
     delta_days = (end_date - start_date).days + 1
     if delta_days > 30:
-        start_date = end_date - timedelta(days=30)
-        delta_days = 31
+        start_date, delta_days = end_date - timedelta(days=30), 31
         
     all_new_data = []
     headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://166w2.com/"}
-    
     for day_offset in range(delta_days):
         target_date = start_date + timedelta(days=day_offset)
         y, m, d = target_date.strftime("%Y"), target_date.month, target_date.day
-        
         if config["type"] == "dpc":
             url = f"https://data.kai8.us/api/lottery/history_dpc/KAI166/{config['code']}/{y}/{m}/{d}"
             try:
@@ -154,7 +153,6 @@ def auto_sync_data(lottery_name):
                             all_new_data.append({"lottery_name": lottery_name, "issue": str(item.get("issue")).strip(), "draw_time": item.get("draw_time"), "draw_code": item.get("draw_code")})
                 except Exception: pass
                 time.sleep(0.01)
-
     if not all_new_data: return False
     
     df_new = pd.DataFrame(all_new_data)
@@ -165,37 +163,32 @@ def auto_sync_data(lottery_name):
     try:
         existing = pd.read_sql(f"SELECT issue FROM lottery_data WHERE lottery_name = '{lottery_name}'", engine)['issue'].astype(str).str.strip().tolist()
         df_new = df_new[~df_new['issue'].isin(existing)]
-        
         if not df_new.empty:
             df_new.to_sql('lottery_data', engine, if_exists='append', index=False)
             return True
-    except Exception:
-        pass
+    except Exception: pass
     return False
 
-# ================= 💾 方案云端保存逻辑 =================
+# ================= 💾 方案云端保存 =================
 def save_scheme_to_db(scheme):
     try:
         df = pd.DataFrame([{"id": scheme["id"], "scheme_json": json.dumps(scheme)}])
         with engine.begin() as conn:
             conn.execute(text("DELETE FROM saved_schemes WHERE id = :id"), {"id": scheme["id"]})
             df.to_sql('saved_schemes', engine, if_exists='append', index=False)
-    except Exception as e:
-        st.error(f"方案保存云端失败: {e}")
+    except Exception as e: st.error(f"方案保存云端失败: {e}")
 
 def delete_scheme_from_db(scheme_id):
     try:
         with engine.begin() as conn:
             conn.execute(text("DELETE FROM saved_schemes WHERE id = :id"), {"id": scheme_id})
-    except Exception as e:
-        st.error(f"方案删除失败: {e}")
+    except Exception as e: st.error(f"方案删除失败: {e}")
 
 def load_schemes():
     try:
         df = pd.read_sql("SELECT scheme_json FROM saved_schemes", engine)
         return [json.loads(row) for row in df['scheme_json']]
-    except:
-        return []
+    except: return []
 
 if 'schemes' not in st.session_state: st.session_state.schemes = load_schemes() 
 if 'editing_id' not in st.session_state: st.session_state.editing_id = None
@@ -219,11 +212,9 @@ def parse_draw(row):
     return [], 0
 
 # ================= 2. 侧边栏控制台 =================
-st.sidebar.markdown("### ⚙️ 全局控制")
-st.sidebar.markdown("**📅 快捷时间**")
+st.sidebar.markdown("### 全局控制")
 btn_col1, btn_col2, btn_col3 = st.sidebar.columns(3)
 today = datetime.today().date()
-yesterday = today - timedelta(days=1)
 month_start = today - timedelta(days=30)
 
 if btn_col1.button("今天", use_container_width=True): st.session_state.date_range = (today, today)
@@ -235,11 +226,11 @@ start_date = st.sidebar.date_input("开始日期", value=st.session_state.date_r
 end_date = st.sidebar.date_input("结束日期", value=st.session_state.date_range[1])
 
 st.sidebar.markdown("---")
-st.sidebar.markdown("### 📝 方案管理")
+st.sidebar.markdown("### 方案管理")
 
 is_editing = st.session_state.editing_id is not None
 edit_scheme = next((s for s in st.session_state.schemes if s['id'] == st.session_state.editing_id), None) if is_editing else None
-form_title = "✏️ 修改方案" if is_editing else "➕ 新增方案"
+form_title = "修改方案" if is_editing else "新增方案"
 
 with st.sidebar.expander(form_title, expanded=is_editing):
     if is_editing: st.info(f"正在修改：{edit_scheme['name']}")
@@ -255,7 +246,7 @@ with st.sidebar.expander(form_title, expanded=is_editing):
     def_rebate = edit_scheme['rebate'] if is_editing else 0.155
 
     scheme_name = st.text_input("方案名称", value=def_name)
-    group_name = st.text_input("📦 所属组合 (可选)", value=def_group, placeholder="比如：544大方案")
+    group_name = st.text_input("所属组合 (可选)", value=def_group, placeholder="比如：544大方案")
     category = st.selectbox("玩法类目", ["连码复式", "连码对碰", "特码类"], index=["连码复式", "连码对碰", "特码类"].index(def_cat))
     
     if is_editing:
@@ -301,11 +292,12 @@ with st.sidebar.expander(form_title, expanded=is_editing):
     bet_amount = st.number_input("单注金额", value=def_bet, step=1)
     rebate = st.number_input("退水比例", value=def_rebate, step=0.005, format="%.3f")
 
-    btn_text = "💾 保存修改" if is_editing else "➕ 添加方案"
+    btn_text = "保存修改" if is_editing else "添加方案"
     if st.button(btn_text, use_container_width=True, type="primary"):
         try:
-            num_pool = [int(x) for x in numbers_str.replace(",", " ").split()]
-            num_pool2 = [int(x) for x in numbers2_str.replace(",", " ").split()] if numbers2_str else []
+            num_pool = [int(x) for x in re.findall(r'\d+', str(numbers_str))]
+            num_pool2 = [int(x) for x in re.findall(r'\d+', str(numbers2_str))] if numbers2_str else []
+            
             new_scheme = {
                 "id": edit_scheme['id'] if is_editing else str(uuid.uuid4()),
                 "name": scheme_name, "group_name": group_name, "category": category, 
@@ -321,7 +313,8 @@ with st.sidebar.expander(form_title, expanded=is_editing):
                 st.session_state.schemes.append(new_scheme)
             save_scheme_to_db(new_scheme) 
             st.rerun()
-        except: st.error("号码格式有误！")
+        except Exception as e: 
+            st.error(f"操作失败: {e}")
     if is_editing:
         if st.button("取消修改", use_container_width=True): 
             st.session_state.editing_id = None
@@ -333,7 +326,7 @@ def render_scheme_row(s):
     is_active = c1.checkbox(s['name'], value=s['active'], key=f"chk_{s['id']}")
     if is_active != s['active']: 
         s['active'] = is_active
-        save_scheme_to_db(s) # 💡 勾选立刻存库
+        save_scheme_to_db(s)
     if c2.button("改", key=f"e_{s['id']}"): st.session_state.editing_id = s['id']; st.rerun()
     if c3.button("删", key=f"d_{s['id']}"):
         st.session_state.schemes = [x for x in st.session_state.schemes if x['id'] != s['id']]
@@ -342,7 +335,7 @@ def render_scheme_row(s):
     if s['active']: active_schemes.append(s)
 
 if st.session_state.schemes:
-    with st.sidebar.expander("📁 已保存的方案列表", expanded=True):
+    with st.sidebar.expander("已保存的方案列表", expanded=True):
         groups = {}
         for s in st.session_state.schemes:
             g_name = s.get('group_name', '').strip() or "（未分组）"
@@ -353,33 +346,33 @@ if st.session_state.schemes:
                 for s in s_list: render_scheme_row(s)
             else:
                 group_active = all(s['active'] for s in s_list)
-                new_group_active = st.checkbox(f"📦 {g_name}", value=group_active, key=f"grp_{g_name}")
+                new_group_active = st.checkbox(f"组合: {g_name}", value=group_active, key=f"grp_{g_name}")
                 if new_group_active != group_active:
                     for s in s_list: 
                         s['active'] = new_group_active
-                        save_scheme_to_db(s) 
+                        save_scheme_to_db(s)
                     st.rerun()
-                with st.expander(f"🔽 查看 {g_name} 内的 {len(s_list)} 个方案", expanded=False):
+                with st.expander(f"查看 {g_name} 内的方案", expanded=False):
                     for s in s_list: render_scheme_row(s)
 
 # ================= 3. 主界面：控制台 =================
-st.markdown(f"<h2 style='font-size: 20px; display:inline-block;'>📊 历史盈亏回测</h2> <span style='font-size:12px;color:#A3A3A3;margin-left:10px;'>范围: {start_date} 至 {end_date}</span>", unsafe_allow_html=True)
+st.markdown(f"<h2 style='font-size: 20px; display:inline-block;'>历史盈亏回测</h2> <span style='font-size:12px;color:#A3A3A3;margin-left:10px;'>范围: {start_date} 至 {end_date}</span>", unsafe_allow_html=True)
 
 c_lottery, c_action = st.columns([1.5, 2.5])
 with c_lottery:
-    selected_lottery = st.selectbox("🎯 目标彩种", available_lotteries)
+    selected_lottery = st.selectbox("目标彩种", available_lotteries)
     st.query_params["lottery"] = selected_lottery 
     
     is_high_freq = ("宾果" in selected_lottery or "加拿大" in selected_lottery)
     
-    # 💡 自动刷新机制：如果是高频彩，开启自动刷新，每 60 秒刷新一次
     if is_high_freq:
         st_autorefresh(interval=60000, limit=None, key="high_freq_refresh")
-        
-    cache_key = f"synced_{selected_lottery}"
-    if cache_key not in st.session_state:
         auto_sync_data(selected_lottery)
-        st.session_state[cache_key] = True
+    else:
+        cache_key = f"synced_{selected_lottery}"
+        if cache_key not in st.session_state:
+            auto_sync_data(selected_lottery)
+            st.session_state[cache_key] = True
 
     try:
         query = f"SELECT issue as 期号, draw_time as 开奖日期, draw_code as 开奖号码 FROM lottery_data WHERE lottery_name = '{selected_lottery}'"
@@ -393,7 +386,7 @@ with c_lottery:
 
 with c_action:
     st.markdown("<div style='margin-top: 10px;'></div>", unsafe_allow_html=True)
-    if st.button("⚡ 立即手动刷新数据", use_container_width=True, type="primary"):
+    if st.button("立即手动刷新数据", use_container_width=True, type="primary"):
         auto_sync_data(selected_lottery)
         st.rerun()
 
@@ -412,11 +405,10 @@ if not df_all.empty:
         </div>
         """, unsafe_allow_html=True)
 
-# 💡 报警阈值设置区
-with st.expander("⚙️ 报警线设置与图表调节", expanded=False):
+with st.expander("报警线设置与图表调节", expanded=False):
     c_alert1, c_alert2 = st.columns(2)
-    with c_alert1: st.number_input("📈 正峰值报警线 (元) - 止盈", step=1000.0, key="pos_alert", on_change=sync_alerts_to_url)
-    with c_alert2: st.number_input("📉 负峰值报警线 (元) - 止损", step=-1000.0, key="neg_alert", on_change=sync_alerts_to_url)
+    with c_alert1: st.number_input("正峰值报警线 (元) - 止盈", step=1000.0, key="pos_alert", on_change=sync_alerts_to_url)
+    with c_alert2: st.number_input("负峰值报警线 (元) - 止损", step=-1000.0, key="neg_alert", on_change=sync_alerts_to_url)
     new_height = st.slider("图表高度", min_value=250, max_value=900, value=st.session_state.chart_height, step=50)
     if new_height != st.session_state.chart_height:
         st.session_state.chart_height = new_height
@@ -501,11 +493,11 @@ def calculate_scheme(df, scheme, time_filter=""):
 
 # ================= 5. 测算结果展示 =================
 if not active_schemes:
-    st.info("👈 请在左侧勾选至少一个方案以展示测算结果。")
+    st.info("请在左侧勾选至少一个方案以展示测算结果。")
 else:
     df_filtered = df_all[(df_all["日期_only"] >= start_date) & (df_all["日期_only"] <= end_date)].copy()
     if df_filtered.empty:
-        st.warning("⚠️ 当前日期范围内云端没有数据！请调整左侧时间范围。")
+        st.warning("当前日期范围内云端没有数据！请调整左侧时间范围。")
         st.stop()
         
     df_filtered["正码"], df_filtered["特码"] = zip(*df_filtered.apply(parse_draw, axis=1))
@@ -534,29 +526,28 @@ else:
     alert_pos_triggered = peak_value >= st.session_state.pos_alert
     alert_neg_triggered = low_peak_value <= st.session_state.neg_alert
     
-    # 💡 语音报警
     if alert_pos_triggered or alert_neg_triggered:
         play_beep_sound()
         if alert_pos_triggered and alert_neg_triggered:
-            st.error(f"🚨 **极度波动报警！** 触发正峰值线 (最高: ¥{peak_value:,.2f}) 且 触发负峰值线 (最低: ¥{low_peak_value:,.2f})。")
+            st.error(f"极度波动报警！触发正峰值线 (最高: ¥{peak_value:,.2f}) 且 触发负峰值线 (最低: ¥{low_peak_value:,.2f})。")
         elif alert_pos_triggered:
-            st.success(f"🎉 **止盈报警！** 突破正峰值报警线！最高盈亏达到 ¥{peak_value:,.2f} (设定线: ¥{st.session_state.pos_alert:,.2f})")
+            st.success(f"止盈报警！突破正峰值报警线！最高盈亏达到 ¥{peak_value:,.2f} (设定线: ¥{st.session_state.pos_alert:,.2f})")
         elif alert_neg_triggered:
-            st.warning(f"⚠️ **止损报警！** 跌破负峰值报警线！最低盈亏达到 ¥{low_peak_value:,.2f} (设定线: ¥{st.session_state.neg_alert:,.2f})")
+            st.warning(f"止损报警！跌破负峰值报警线！最低盈亏达到 ¥{low_peak_value:,.2f} (设定线: ¥{st.session_state.neg_alert:,.2f})")
 
     active_groups = set([s.get('group_name','').strip() for s in active_schemes if s.get('group_name','').strip()])
     combined_names = list(active_groups)[0] if active_groups and len(active_groups) == 1 else " + ".join([s['name'] for s in active_schemes])
     
-    st.markdown(f"<div style='font-size:16px; font-weight:bold; margin-bottom:5px;'>💰 合并总盈亏 ({combined_names})</div>", unsafe_allow_html=True)
+    st.markdown(f"### 合并总盈亏 ({combined_names})")
     
     c_mid, c_right = st.columns([1.5, 3])
     with c_mid:
         st.markdown(f"""
-        <div class="custom-card" style="border-left: 4px solid {'#22C55E' if total_combined_pl >= 0 else '#EF4444'}; display: flex; flex-direction: column; justify-content: center; height: 100%;">
-            <div class="text-gray">合计盈亏 (元)</div>
-            <div class="huge-number {'profit' if total_combined_pl >= 0 else 'loss'}">¥ {total_combined_pl:,.2f}</div>
-            <div class="peak-text-pos">📈 最高: ¥ {peak_value:,.2f} <span style="color:#A3A3A3;font-weight:normal;">({peak_issue}期)</span></div>
-            <div class="peak-text-neg">📉 最低: ¥ {low_peak_value:,.2f} <span style="color:#A3A3A3;font-weight:normal;">({low_peak_issue}期)</span></div>
+        <div class="custom-card" style="border-left: 4px solid {'#22C55E' if total_combined_pl >= 0 else '#EF4444'}; padding: 15px; background: #121212; border-radius: 6px;">
+            <div class="text-gray" style="color: #A3A3A3; font-size: 13px;">合计盈亏 (元)</div>
+            <div class="huge-number" style="font-size: 36px; font-weight: 800; color: {'#22C55E' if total_combined_pl >= 0 else '#EF4444'};">¥ {total_combined_pl:,.2f}</div>
+            <div class="peak-text-pos" style="color: #22C55E; font-size: 13px; margin-top: 5px;">最高: ¥ {peak_value:,.2f} ({peak_issue}期)</div>
+            <div class="peak-text-neg" style="color: #EF4444; font-size: 13px; margin-top: 3px;">最低: ¥ {low_peak_value:,.2f} ({low_peak_issue}期)</div>
         </div>
         """, unsafe_allow_html=True)
     
@@ -572,11 +563,11 @@ else:
         fig_combined.update_traces(selector=dict(type='scatter', mode='lines+markers'), line_color='#38BDF8', line_width=2, marker=dict(size=5, color='#38BDF8'))
         st.plotly_chart(fig_combined, use_container_width=True, key="chart_combined")
 
-    with st.expander("📋 查看合并每日明细记录", expanded=False):
+    with st.expander("查看合并每日明细记录", expanded=False):
         st.dataframe(merged_pl, use_container_width=True, hide_index=True, height=200)
     
     st.markdown("---")
-    st.markdown("<div style='font-size:16px; font-weight:bold; margin-bottom:5px;'>🔍 各方案独立明细</div>", unsafe_allow_html=True)
+    st.markdown("### 各方案独立明细")
     
     tabs = st.tabs([s['name'] for s in active_schemes])
     for idx, scheme in enumerate(active_schemes):
@@ -596,16 +587,16 @@ else:
             col_res_left, col_res_right = st.columns([1.5, 3])
             with col_res_left:
                 st.markdown(f"""
-                <div class="custom-card" style="border-left: 4px solid {'#22C55E' if total_pl >= 0 else '#EF4444'};">
-                    <div class="text-gray">累计盈亏 (元)</div>
-                    <div class="huge-number {'profit' if total_pl >= 0 else 'loss'}">¥ {total_pl:,.2f}</div>
-                    <div class="peak-text-pos">📈 最高: ¥ {s_peak_value:,.2f} <span style="color:#A3A3A3;font-weight:normal;">({s_peak_issue}期)</span></div>
-                    <div class="peak-text-neg">📉 最低: ¥ {s_low_peak_value:,.2f} <span style="color:#A3A3A3;font-weight:normal;">({s_low_peak_issue}期)</span></div>
+                <div class="custom-card" style="border-left: 4px solid {'#22C55E' if total_pl >= 0 else '#EF4444'}; padding: 15px; background: #121212; border-radius: 6px;">
+                    <div class="text-gray" style="color: #A3A3A3; font-size: 13px;">累计盈亏 (元)</div>
+                    <div class="huge-number" style="font-size: 36px; font-weight: 800; color: {'#22C55E' if total_pl >= 0 else '#EF4444'};">¥ {total_pl:,.2f}</div>
+                    <div class="peak-text-pos" style="color: #22C55E; font-size: 13px; margin-top: 5px;">最高: ¥ {s_peak_value:,.2f} ({s_peak_issue}期)</div>
+                    <div class="peak-text-neg" style="color: #EF4444; font-size: 13px; margin-top: 3px;">最低: ¥ {s_low_peak_value:,.2f} ({s_low_peak_issue}期)</div>
                 </div>
-                <div class="custom-card" style="margin-top:5px;">
-                    <div class="text-gray">胜率</div>
-                    <div class="huge-number" style="color: #FFF;">{win_rate:.1f}%</div>
-                    <div class="text-gray" style="margin-top:2px;">命中 {win_periods} / 总 {len(res_df)} 期</div>
+                <div class="custom-card" style="margin-top: 10px; padding: 15px; background: #121212; border-radius: 6px;">
+                    <div class="text-gray" style="color: #A3A3A3; font-size: 13px;">胜率</div>
+                    <div class="huge-number" style="color: #FFF; font-size: 36px; font-weight: 800;">{win_rate:.1f}%</div>
+                    <div class="text-gray" style="color: #A3A3A3; font-size: 13px; margin-top: 5px;">命中 {win_periods} / 总 {len(res_df)} 期</div>
                 </div>
                 """, unsafe_allow_html=True)
             
