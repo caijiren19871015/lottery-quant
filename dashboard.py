@@ -64,7 +64,6 @@ st.markdown("""
 try:
     DB_URL = st.secrets["DB_URL"]
 except:
-    # 如果你在本地跑，请填入真实密码
     DB_URL = "postgresql+psycopg2://postgres.ishhmayoclgbnwdwojim:你的真实密码@aws-0-ap-northeast-1.pooler.supabase.com:5432/postgres"
 
 @st.cache_resource
@@ -112,14 +111,29 @@ LOTTERY_MAP = {
 }
 
 def auto_sync_data(lottery_name):
-    """静默同步最近30天数据，弥补断档"""
+    """智能同步：只抓缺失的天数，避免全量扫描卡死"""
     config = LOTTERY_MAP.get(lottery_name)
-    if not config: return False
+    if not config: return False, "未知彩种"
     
     end_date = datetime.today().date()
-    start_date = end_date - timedelta(days=30)
-    delta_days = (end_date - start_date).days + 1
+    try:
+        df_old = pd.read_sql(f"SELECT draw_time FROM lottery_data WHERE lottery_name = '{lottery_name}' ORDER BY draw_time DESC LIMIT 1", engine)
+        if df_old.empty:
+            start_date = end_date - timedelta(days=3) # 空表默认抓3天
+        else:
+            max_date = pd.to_datetime(df_old.iloc[0]['draw_time']).date()
+            start_date = max_date
+    except Exception:
+        return False, "数据库连接异常"
+
+    if start_date > end_date: return False, "无断层"
     
+    delta_days = (end_date - start_date).days + 1
+    # 如果断层太久（超过30天），为了防封禁，最多只抓30天
+    if delta_days > 30:
+        start_date = end_date - timedelta(days=30)
+        delta_days = 31
+        
     all_new_data = []
     headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://166w2.com/"}
     
@@ -147,7 +161,7 @@ def auto_sync_data(lottery_name):
                 except Exception: pass
                 time.sleep(0.01)
 
-    if not all_new_data: return False
+    if not all_new_data: return False, "无新数据"
     
     df_new = pd.DataFrame(all_new_data)
     df_new['issue'] = df_new['issue'].astype(str).str.strip()
@@ -160,10 +174,10 @@ def auto_sync_data(lottery_name):
         
         if not df_new.empty:
             df_new.to_sql('lottery_data', engine, if_exists='append', index=False)
-            return True
+            return True, f"成功补齐 {len(df_new)} 期"
     except Exception:
         pass
-    return False
+    return False, "无新数据"
 
 # ================= 💾 方案云端保存逻辑 =================
 def save_scheme_to_db(scheme):
@@ -366,10 +380,10 @@ with c_lottery:
     
     is_high_freq = ("宾果" in selected_lottery or "加拿大" in selected_lottery)
     
-    # 💡 核心：打开网页或切换彩种时，自动静默补齐最近30天数据
+    # 💡 核心优化：如果发现不是今天，才去同步数据。避免每次刷新都卡半天。
     cache_key = f"synced_{selected_lottery}"
     if cache_key not in st.session_state:
-        with st.spinner("正在后台自动补齐近期数据..."):
+        with st.spinner("同步今日最新数据..."):
             auto_sync_data(selected_lottery)
         st.session_state[cache_key] = True
 
@@ -384,21 +398,20 @@ with c_lottery:
         df_all = pd.DataFrame()
 
 with c_action:
+    st.markdown("<div style='margin-top: 10px;'></div>", unsafe_allow_html=True)
     if is_high_freq:
-        st.markdown("<div style='margin-top: 10px;'></div>", unsafe_allow_html=True)
-        # 自动同步开关控制
         if not st.session_state.auto_sync:
-            if st.button("▶️ 开启页面自动更新 (每60秒)", use_container_width=True, type="primary"):
+            if st.button("▶️ 开启自动页面刷新 (每60秒)", use_container_width=True, type="primary"):
                 st.session_state.auto_sync = True
                 st.query_params["auto_sync"] = "true"
                 st.rerun()
         else:
-            if st.button("⏸️ 暂停自动更新", use_container_width=True):
+            if st.button("⏸️ 暂停自动刷新", use_container_width=True):
                 st.session_state.auto_sync = False
                 if "auto_sync" in st.query_params: del st.query_params["auto_sync"]
                 st.rerun()
 
-# 💡 JS 定时刷新（仅在开启自动更新且为高频彩时生效）
+# 💡 JS 定时刷新（仅在开启自动刷新且为高频彩时生效）
 if st.session_state.auto_sync and is_high_freq:
     js = f"""
     <script>
