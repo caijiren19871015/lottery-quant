@@ -104,7 +104,7 @@ def play_beep_sound():
     """
     components.html(js, height=0, width=0)
 
-# ================= 🔄 数据抓取逻辑 (完全还原旧代码) =================
+# ================= 🔄 数据抓取逻辑 (极速双接口) =================
 LOTTERY_MAP = {
     "香港六合彩": {"code": "HK6", "type": "dpc"},
     "快乐8六合彩": {"code": "KLLHC", "type": "dpc"},
@@ -128,9 +128,11 @@ def update_latest_data(lottery_name, status_container=None):
     try:
         df_old = pd.read_sql(f"SELECT issue, draw_time FROM lottery_data WHERE lottery_name = '{lottery_name}' ORDER BY draw_time DESC LIMIT 1", engine)
         if df_old.empty:
+            # 💡 如果库是空的，直接抓最近 30 天
             start_date = datetime.today().date() - timedelta(days=30) 
         else:
             max_date = pd.to_datetime(df_old.iloc[0]['draw_time']).date()
+            # 💡 从库里的最新日期开始抓，确保补全
             start_date = max_date
     except Exception as e:
         return False, f"❌ 读取数据库失败: {e}"
@@ -139,22 +141,27 @@ def update_latest_data(lottery_name, status_container=None):
     if start_date > end_date: return False, "已是最新"
     
     all_new_data = []
-    headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://166w2.com/"}
+    headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://166kai.com/"}
     delta_days = (end_date - start_date).days + 1
 
     if config["type"] == "dpc":
-        # 💡 彻底还原旧代码：单线程，不补零，按天循环
-        if status_container: status_container.info("正在按天抓取传统彩数据...")
+        if status_container: status_container.info("正在按天抓取数据...")
         for day_offset in range(delta_days):
             target_date = start_date + timedelta(days=day_offset)
             y, m, d = target_date.strftime("%Y"), target_date.month, target_date.day
-            url = f"https://data.kai8.us/api/lottery/history_dpc/KAI166/{config['code']}/{y}/{m}/{d}"
+            
+            # 💡 强制使用 api68 接口，专治海外无法抓取的问题
+            date_str = f"{y}-{m:02d}-{d:02d}"
+            url = f"https://api.api68.com/pks/getPksHistoryList.do?date={date_str}&lotCode={config['code']}"
             records = fetch_api(url, headers)
+            
             for item in records:
-                all_new_data.append({"lottery_name": lottery_name, "issue": str(item.get("issue")).strip(), "draw_time": item.get("draw_time"), "draw_code": item.get("draw_code")})
-            time.sleep(0.1) # 稍作延迟，防止被封
+                issue = str(item.get("preDrawIssue") or item.get("issue")).strip()
+                draw_time = item.get("preDrawTime") or item.get("draw_time")
+                draw_code = item.get("preDrawCode") or item.get("draw_code")
+                all_new_data.append({"lottery_name": lottery_name, "issue": issue, "draw_time": draw_time, "draw_code": draw_code})
     else:
-        # 高频彩：保留并发极速抓取
+        # 高频彩：按小时并发
         if status_container: status_container.info("正在通过高频通道极速抓取...")
         urls_to_fetch = []
         for day_offset in range(delta_days):
@@ -170,7 +177,7 @@ def update_latest_data(lottery_name, status_container=None):
                 for item in records:
                     all_new_data.append({"lottery_name": lottery_name, "issue": str(item.get("issue")).strip(), "draw_time": item.get("draw_time"), "draw_code": item.get("draw_code")})
 
-    if not all_new_data: return False, "⚠️ 接口未返回新数据"
+    if not all_new_data: return False, "⚠️ 接口未返回新数据 (可能接口已失效)"
     
     df_new = pd.DataFrame(all_new_data)
     df_new['issue'] = df_new['issue'].astype(str).str.strip()
@@ -180,16 +187,13 @@ def update_latest_data(lottery_name, status_container=None):
     
     if df_new.empty: return False, "⚠️ 数据无效或已全部存在"
 
-    # 💡 还原旧代码思路：对比过滤，再写入
     if status_container: status_container.info(f"正在写入 {len(df_new)} 条数据...")
     try:
-        # 查出库里已有的期号
         existing_issues = pd.read_sql(f"SELECT issue FROM lottery_data WHERE lottery_name = '{lottery_name}'", engine)['issue'].astype(str).str.strip().tolist()
-        # 过滤掉已有数据
         df_new = df_new[~df_new['issue'].isin(existing_issues)]
         
         if df_new.empty:
-            return False, "已是最新 (无新数据)"
+            return False, f"库内已有，没有新增 (抓到了{len(all_new_data)}条，但都重复了)"
             
         df_new.to_sql('lottery_data', engine, if_exists='append', index=False)
         return True, f"✅ 抓取完成！成功写入 {len(df_new)} 条新开奖"
