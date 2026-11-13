@@ -6,7 +6,6 @@ import itertools
 import uuid
 import json
 import requests
-import time
 from datetime import datetime, timedelta
 import streamlit.components.v1 as components
 from sqlalchemy import create_engine, text
@@ -103,95 +102,68 @@ def play_beep_sound():
     """
     components.html(js, height=0, width=0)
 
-# ================= 🔄 100% 还原你的本地抓取逻辑 =================
+# ================= 🔄 实时数据更新逻辑 (100% 还原你的本地旧代码) =================
 LOTTERY_MAP = {
-    "香港六合彩": {"code": "HK6", "type": "dpc"},
-    "快乐8六合彩": {"code": "KLLHC", "type": "dpc"},
-    "宾果六合彩": {"code": "TWBGLHC", "type": "gpc"},
-    "加拿大六合彩": {"code": "JNDLHC", "type": "gpc"}
+    "香港六合彩": "HK6",
+    "快乐8六合彩": "KLLHC",
+    "加拿大六合彩": "JNDLHC",
+    "宾果六合彩": "TWBGLHC"
 }
 
 def update_latest_data(lottery_name, status_container=None):
-    config = LOTTERY_MAP.get(lottery_name)
-    if not config: return False, "未知彩种"
+    code = LOTTERY_MAP.get(lottery_name)
+    if not code: return False, "未知的彩种代码"
     
-    if status_container: status_container.info("正在读取数据库最新日期...")
-    try:
-        df_old = pd.read_sql(f"SELECT issue, draw_time FROM lottery_data WHERE lottery_name = '{lottery_name}' ORDER BY draw_time DESC LIMIT 1", engine)
-        if df_old.empty:
-            start_date = datetime.today().date() - timedelta(days=30) 
-        else:
-            max_date = pd.to_datetime(df_old.iloc[0]['draw_time']).date()
-            start_date = max_date
-    except Exception as e:
-        return False, f"❌ 读取数据库失败: {e}"
-
-    end_date = datetime.today().date()
-    if start_date > end_date: return False, "已是最新"
-    
-    all_new_data = []
-    
-    # 💡 彻底还原旧代码请求头
+    today = datetime.today()
+    year, month, day = today.strftime("%Y"), today.month, today.day
+    if "宾果" in lottery_name or "加拿大" in lottery_name:
+        url = f"https://data.kai8.us/api/lottery/history_gpc/KAI166/{code}/{year}-{month}-{day}/23/30"
+    else:
+        url = f"https://data.kai8.us/api/lottery/history_dpc/KAI166/{code}/{year}/{month}/{day}"
+        
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         "Referer": "https://166w2.com/"
     }
     
-    delta_days = (end_date - start_date).days + 1
-    debug_msgs = [] # 用于收集报错信息
-
-    for day_offset in range(delta_days):
-        target_date = start_date + timedelta(days=day_offset)
-        y, m, d = target_date.strftime("%Y"), target_date.month, target_date.day
-        
-        if config["type"] == "dpc":
-            # 💡 彻底还原旧代码URL (不补零)
-            url = f"https://data.kai8.us/api/lottery/history_dpc/KAI166/{config['code']}/{y}/{m}/{d}"
-        else:
-            # 💡 彻底还原旧代码URL (23/30)
-            url = f"https://data.kai8.us/api/lottery/history_gpc/KAI166/{config['code']}/{y}-{m}-{d}/23/30"
-            
-        try:
-            res = requests.get(url, headers=headers, timeout=10)
-            if res.status_code == 200:
-                records = res.json().get("data", {}).get("list", [])
-                for item in records:
-                    all_new_data.append({
-                        "lottery_name": lottery_name, 
-                        "issue": str(item.get("issue")).strip(), 
-                        "draw_time": item.get("draw_time"), 
-                        "draw_code": item.get("draw_code")
-                    })
-            else:
-                debug_msgs.append(f"[{y}-{m}-{d}] HTTP {res.status_code}")
-        except Exception as e:
-            debug_msgs.append(f"[{y}-{m}-{d}] 异常: {str(e)[:20]}")
-
-    if not all_new_data: 
-        if debug_msgs:
-            return False, f"⚠️ 接口请求失败，原因: {', '.join(debug_msgs[:2])}..."
-        return False, "⚠️ 接口返回空 (可能是海外IP被拦截或日期错误)"
-    
-    df_new = pd.DataFrame(all_new_data)
-    df_new['issue'] = df_new['issue'].astype(str).str.strip()
-    df_new['draw_time'] = pd.to_datetime(df_new['draw_time'], errors='coerce').dt.tz_localize(None)
-    df_new = df_new.dropna(subset=['draw_time'])
-    df_new = df_new.drop_duplicates(subset=['lottery_name', 'issue'], keep='first')
-    
-    if df_new.empty: return False, "⚠️ 数据无效或已全部存在"
-
-    if status_container: status_container.info(f"正在写入 {len(df_new)} 条数据...")
     try:
-        existing_issues = pd.read_sql(f"SELECT issue FROM lottery_data WHERE lottery_name = '{lottery_name}'", engine)['issue'].astype(str).str.strip().tolist()
-        df_new = df_new[~df_new['issue'].isin(existing_issues)]
-        
-        if df_new.empty:
-            return False, "已是最新 (抓到的数据均已存在)"
+        res = requests.get(url, headers=headers, timeout=10)
+        if res.status_code == 200:
+            json_data = res.json()
+            data_obj = json_data.get("data", {})
+            records = data_obj.get("list", [])
             
-        df_new.to_sql('lottery_data', engine, if_exists='append', index=False)
-        return True, f"✅ 抓取完成！成功写入 {len(df_new)} 条新开奖"
+            if not records:
+                return False, "接口未返回数据（可能今天还没开奖）"
+                
+            new_records = []
+            for item in records:
+                new_records.append({
+                    "lottery_name": lottery_name,
+                    "issue": str(item.get("issue")).strip(),
+                    "draw_time": item.get("draw_time"),
+                    "draw_code": item.get("draw_code")
+                })
+                
+            df_new = pd.DataFrame(new_records)
+            df_new['draw_time'] = pd.to_datetime(df_new['draw_time'], errors='coerce').dt.tz_localize(None)
+            df_new = df_new.dropna(subset=['draw_time'])
+            
+            # 写入数据库 (过滤已存在的期号)
+            try:
+                existing_issues = pd.read_sql(f"SELECT issue FROM lottery_data WHERE lottery_name = '{lottery_name}'", engine)['issue'].astype(str).str.strip().tolist()
+                df_new = df_new[~df_new['issue'].isin(existing_issues)]
+                
+                if df_new.empty:
+                    return False, "已是最新 (无新数据)"
+                    
+                df_new.to_sql('lottery_data', engine, if_exists='append', index=False)
+                return True, f"成功更新！最新一期：{df_new.iloc[-1]['issue']}"
+            except Exception as e:
+                return False, f"❌ 写入数据库失败: {e}"
+        return False, f"请求失败，HTTP: {res.status_code}"
     except Exception as e:
-        return False, f"❌ 写入数据库失败: {e}"
+        return False, f"网络异常: {e}"
 
 # ================= 💾 方案保存逻辑 =================
 def save_scheme_to_db(scheme):
@@ -392,15 +364,6 @@ with c_lottery:
     selected_lottery = st.selectbox("🎯 目标彩种", available_lotteries)
     is_high_freq = ("宾果" in selected_lottery or "加拿大" in selected_lottery)
     
-    if is_high_freq:
-        if "last_checked" not in st.session_state or st.session_state.get("last_lottery") != selected_lottery or (datetime.now() - st.session_state.last_checked).total_seconds() > 30:
-            with st.spinner("云端极速并发获取数据中..."):
-                success, msg = update_latest_data(selected_lottery, status_box)
-                st.session_state.last_checked = datetime.now()
-                st.session_state.last_lottery = selected_lottery
-                if success: status_box.success(msg)
-                else: status_box.warning(msg)
-
     try:
         query = f"SELECT issue as 期号, draw_time as 开奖日期, draw_code as 开奖号码 FROM lottery_data WHERE lottery_name = '{selected_lottery}'"
         df_all = pd.read_sql(query, engine)
@@ -429,24 +392,24 @@ if not df_all.empty:
         </div>
         """, unsafe_allow_html=True)
 
-if not is_high_freq:
-    with st.expander("🔄 传统彩数据更新 (香港/快乐8)", expanded=True):
-        c_sync1, c_sync2 = st.columns([1.5, 3.5])
-        with c_sync1:
-            if st.button("🔄 点击强制获取最新数据", use_container_width=True, type="primary"):
-                with st.spinner("正在请求接口..."):
-                    success, msg = update_latest_data(selected_lottery, status_box)
-                    st.session_state.update_msg = ("success" if success else "error", msg)
-                    st.rerun()
-        with c_sync2:
-            if st.session_state.update_msg:
-                status, msg = st.session_state.update_msg
-                if status == "success": st.success(msg, icon="✅")
-                else: st.error(msg, icon="❌")
-                st.session_state.update_msg = None
-            else:
-                st.info("每天 21:30 后打开网页会自动补齐当日数据，也可以手动点击强制更新。")
-else:
+with st.expander("🔄 数据更新", expanded=True):
+    c_sync1, c_sync2 = st.columns([1.5, 3.5])
+    with c_sync1:
+        if st.button("🔄 点击获取最新开奖数据", use_container_width=True, type="primary"):
+            with st.spinner("正在请求接口..."):
+                success, msg = update_latest_data(selected_lottery, status_box)
+                st.session_state.update_msg = ("success" if success else "error", msg)
+                st.rerun()
+    with c_sync2:
+        if st.session_state.update_msg:
+            status, msg = st.session_state.update_msg
+            if status == "success": st.success(msg, icon="✅")
+            else: st.error(msg, icon="❌")
+            st.session_state.update_msg = None
+        else:
+            st.info("点击获取今日最新数据。")
+
+if is_high_freq:
     with st.expander("⚙️ 报警线设置与图表调节", expanded=False):
         c_alert1, c_alert2 = st.columns(2)
         with c_alert1: st.number_input("📈 正峰值报警线 (元) - 止盈", step=1000.0, key="pos_alert", on_change=sync_alerts_to_url)
