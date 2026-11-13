@@ -25,12 +25,16 @@ st.markdown("""
     h1, h2, h3 { color: #FFFFFF !important; font-family: -apple-system, sans-serif; margin-bottom: 0px !important; }
     label { color: #A3A3A3 !important; font-size: 12px !important; padding-bottom: 0px !important; }
     [data-testid="stSidebar"] { background-color: #0F0F0F; border-right: 1px solid #262626; }
+    
+    /* 开奖球（波色样式） */
     .ball-container { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
     .ball { display: inline-flex; align-items: center; justify-content: center; width: 32px; height: 32px; border-radius: 50%; font-weight: bold; font-size: 14px; box-shadow: 0 2px 4px rgba(0,0,0,0.3); }
     .ball-red { background-color: #7F1D1D; color: #FCA5A5; border: 1px solid #EF4444; }
     .ball-blue { background-color: #1E3A8A; color: #93C5FD; border: 1px solid #3B82F6; }
     .ball-green { background-color: #14532D; color: #86EFAC; border: 1px solid #22C55E; }
     .ball-special { box-shadow: 0 0 8px 1px rgba(255, 255, 255, 0.4); transform: scale(1.05); font-weight: 900; }
+    
+    /* 核心数据大数字 */
     .huge-number { font-size: 36px; font-weight: 800; line-height: 1.1; }
     .profit { color: #22C55E; }
     .loss { color: #EF4444; }
@@ -144,17 +148,16 @@ def auto_sync_data(lottery_name):
     except Exception: pass
     return False
 
-# ================= 💾 方案云端保存 (加固版) =================
+# ================= 💾 方案云端保存 (完美兼容版) =================
 def save_scheme_to_db(scheme):
     try:
         df = pd.DataFrame([{"id": scheme["id"], "scheme_json": json.dumps(scheme)}])
         with engine.begin() as conn:
             conn.execute(text("DELETE FROM saved_schemes WHERE id = :id"), {"id": scheme["id"]})
             df.to_sql('saved_schemes', engine, if_exists='append', index=False)
-        # 💡 给个提示
         st.toast(f"方案 '{scheme['name']}' 已保存至云端", icon="✅")
     except Exception as e: 
-        st.error(f"方案保存云端失败 (请检查Supabase连接): {e}")
+        st.error(f"方案保存云端失败: {e}")
 
 def delete_scheme_from_db(scheme_id):
     try:
@@ -167,11 +170,17 @@ def delete_scheme_from_db(scheme_id):
 def load_schemes():
     try:
         df = pd.read_sql("SELECT scheme_json FROM saved_schemes", engine)
-        # 如果表为空，返回空列表
         if df.empty: return []
-        return [json.loads(row) for row in df['scheme_json']]
+        
+        schemes = []
+        for row in df['scheme_json']:
+            # 💡 核心修复：兼容旧数据库存进去的 Dict 和 Str 两种格式
+            if isinstance(row, dict):
+                schemes.append(row)
+            elif isinstance(row, str):
+                schemes.append(json.loads(row))
+        return schemes
     except Exception as e:
-        # 💡 致命错误暴露：如果数据库连不上，不要默默吃掉错误
         st.error(f"🚨 读取方案失败，请检查云端数据库连接！ {e}")
         return []
 
@@ -395,6 +404,7 @@ if not df_all.empty:
         </div>
         """, unsafe_allow_html=True)
 
+# 💡 报警线设置与图表调节面板
 with st.expander("报警线设置与图表调节", expanded=False):
     c_alert1, c_alert2 = st.columns(2)
     with c_alert1: st.number_input("正峰值报警线 (元) - 止盈", step=1000.0, key="pos_alert", on_change=sync_alerts_to_url)
