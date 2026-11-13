@@ -13,13 +13,11 @@ import streamlit.components.v1 as components
 from sqlalchemy import create_engine, text
 from streamlit_autorefresh import st_autorefresh
 
-# ================= 🎨 页面配置与完美 UI CSS (恢复版) =================
+# ================= 🎨 页面配置与完美 UI CSS =================
 st.set_page_config(page_title="数据量化终端", layout="wide", page_icon="📊")
 
-# 强制让 Streamlit 使用暗色主题（部分环境会默认亮色）
 st.markdown("""
     <style>
-    /* 隐藏默认头部，设置全局底色 */
     header[data-testid="stHeader"] { display: none !important; }
     .block-container { 
         padding-top: 0.5rem !important; padding-bottom: 0.5rem !important; 
@@ -27,21 +25,17 @@ st.markdown("""
     }
     .stApp { background-color: #0A0A0A; color: #E5E5E5; }
     
-    /* 卡片样式 */
     .custom-card {
         background-color: #121212; border: 1px solid #262626;
         border-radius: 6px; padding: 15px; margin-bottom: 10px;
         box-shadow: 0 4px 6px rgba(0,0,0,0.3);
     }
     
-    /* 标题与标签 */
     h1, h2, h3 { color: #FFFFFF !important; font-family: -apple-system, sans-serif; margin-bottom: 0px !important; }
     label { color: #A3A3A3 !important; font-size: 12px !important; padding-bottom: 0px !important; }
     
-    /* 侧边栏 */
     [data-testid="stSidebar"] { background-color: #0F0F0F; border-right: 1px solid #262626; }
     
-    /* 💡 核心：开奖球（波色样式） */
     .ball-container { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
     .ball {
         display: inline-flex; align-items: center; justify-content: center;
@@ -53,7 +47,6 @@ st.markdown("""
     .ball-green { background-color: #14532D; color: #86EFAC; border: 1px solid #22C55E; }
     .ball-special { box-shadow: 0 0 8px 1px rgba(255, 255, 255, 0.4); transform: scale(1.05); font-weight: 900; }
     
-    /* 核心数据大数字 */
     .huge-number { font-size: 36px; font-weight: 800; line-height: 1.1; }
     .profit { color: #22C55E; }
     .loss { color: #EF4444; }
@@ -67,7 +60,6 @@ st.markdown("""
 try:
     DB_URL = st.secrets["DB_URL"]
 except:
-    # ⚠️ 请确保这里是你正确的密码 PPOOIIpoipoi8899
     DB_URL = "postgresql+psycopg2://postgres.ishhmayoclgbnwdwojim:PPOOIIpoipoi8899@aws-0-ap-northeast-1.pooler.supabase.com:5432/postgres"
 
 @st.cache_resource
@@ -195,6 +187,7 @@ if 'editing_id' not in st.session_state: st.session_state.editing_id = None
 
 # 💡 URL 记忆
 if "chart_height" not in st.session_state: st.session_state.chart_height = int(st.query_params.get("chart_height", 350))
+if "dtick_val" not in st.session_state: st.session_state.dtick_val = int(st.query_params.get("dtick_val", 10000))
 if "pos_alert" not in st.session_state: st.session_state.pos_alert = float(st.query_params.get("pos_alert", 10000.0))
 if "neg_alert" not in st.session_state: st.session_state.neg_alert = float(st.query_params.get("neg_alert", -5000.0))
 
@@ -405,15 +398,26 @@ if not df_all.empty:
         </div>
         """, unsafe_allow_html=True)
 
+# 💡 这里是修改后的报警线设置与图表调节面板
 with st.expander("报警线设置与图表调节", expanded=False):
     c_alert1, c_alert2 = st.columns(2)
     with c_alert1: st.number_input("正峰值报警线 (元) - 止盈", step=1000.0, key="pos_alert", on_change=sync_alerts_to_url)
     with c_alert2: st.number_input("负峰值报警线 (元) - 止损", step=-1000.0, key="neg_alert", on_change=sync_alerts_to_url)
-    new_height = st.slider("图表高度", min_value=250, max_value=900, value=st.session_state.chart_height, step=50)
-    if new_height != st.session_state.chart_height:
-        st.session_state.chart_height = new_height
-        st.query_params["chart_height"] = str(new_height)
-        st.rerun()
+    
+    c_height, c_dtick = st.columns(2)
+    with c_height:
+        new_height = st.slider("图表高度", min_value=250, max_value=900, value=st.session_state.chart_height, step=50)
+        if new_height != st.session_state.chart_height:
+            st.session_state.chart_height = new_height
+            st.query_params["chart_height"] = str(new_height)
+            st.rerun()
+            
+    with c_dtick:
+        new_dtick = st.number_input("坐标轴主单位 (Y轴)", min_value=100, max_value=1000000, value=st.session_state.dtick_val, step=1000)
+        if new_dtick != st.session_state.dtick_val:
+            st.session_state.dtick_val = new_dtick
+            st.query_params["dtick_val"] = str(new_dtick)
+            st.rerun()
 
 # ================= 4. 计算引擎 =================
 def calculate_scheme(df, scheme, time_filter=""):
@@ -556,7 +560,8 @@ else:
         fig_combined.update_layout(
             plot_bgcolor='rgba(0,0,0,0)', paper_bgcolor='rgba(0,0,0,0)', 
             height=st.session_state.chart_height, margin=dict(l=10, r=10, t=25, b=5), 
-            title=dict(text="合并总盈亏走势", font=dict(size=12, color="#A3A3A3")), yaxis=dict(dtick=10000)
+            title=dict(text="合并总盈亏走势", font=dict(size=12, color="#A3A3A3")), 
+            yaxis=dict(dtick=st.session_state.dtick_val) # 💡 应用动态单位
         )
         fig_combined.add_scatter(x=[peak_issue], y=[peak_value], mode='markers+text', text=[f"最高: {peak_value:,.0f}"], textposition="top center", marker=dict(size=8, color='#22C55E', symbol='star'), textfont=dict(color='#22C55E', size=10))
         fig_combined.add_scatter(x=[low_peak_issue], y=[low_peak_value], mode='markers+text', text=[f"最低: {low_peak_value:,.0f}"], textposition="bottom center", marker=dict(size=8, color='#EF4444', symbol='star'), textfont=dict(color='#EF4444', size=10))
@@ -605,7 +610,8 @@ else:
                 fig.update_layout(
                     plot_bgcolor='rgba(0,0,0,0)', paper_bgcolor='rgba(0,0,0,0)', 
                     height=st.session_state.chart_height + 30, margin=dict(l=10, r=10, t=25, b=5), 
-                    title=dict(text="单方案盈亏走势", font=dict(size=12, color="#A3A3A3")), yaxis=dict(dtick=10000)
+                    title=dict(text="单方案盈亏走势", font=dict(size=12, color="#A3A3A3")), 
+                    yaxis=dict(dtick=st.session_state.dtick_val) # 💡 应用动态单位
                 )
                 fig.add_scatter(x=[s_peak_issue], y=[s_peak_value], mode='markers+text', text=[f"最高: {s_peak_value:,.0f}"], textposition="top center", marker=dict(size=8, color='#22C55E', symbol='star'), textfont=dict(color='#22C55E', size=10))
                 fig.add_scatter(x=[s_low_peak_issue], y=[s_low_peak_value], mode='markers+text', text=[f"最低: {s_low_peak_value:,.0f}"], textposition="bottom center", marker=dict(size=8, color='#EF4444', symbol='star'), textfont=dict(color='#EF4444', size=10))
