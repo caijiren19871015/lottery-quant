@@ -23,41 +23,40 @@ st.markdown("""
     }
     div[data-testid="stVerticalBlock"] { gap: 0.5rem !important; }
     .stApp { background-color: #0A0A0A; color: #E5E5E5; }
-    div[data-testid="stVerticalBlock"] > div:has(div.custom-card) {
+    
+    /* 卡片样式 */
+    .custom-card {
         background-color: #121212; border: 1px solid #262626;
-        border-radius: 6px; padding: 10px 15px; margin-bottom: 10px;
+        border-radius: 6px; padding: 15px; margin-bottom: 10px;
+        box-shadow: 0 4px 6px rgba(0,0,0,0.3);
     }
+    
+    /* 标题与标签 */
     h1, h2, h3 { color: #FFFFFF !important; font-family: -apple-system, sans-serif; margin-bottom: 0px !important; }
     label { color: #A3A3A3 !important; font-size: 12px !important; padding-bottom: 0px !important; }
-    div[data-baseweb="input"] > div, div[data-baseweb="select"] > div, textarea {
-        background-color: #1A1A1A !important; border: 1px solid #333 !important; color: #FFF !important; min-height: 30px !important;
-    }
-    .stButton>button {
-        border-radius: 4px; border: 1px solid #333; background-color: #1A1A1A;
-        color: #FFF; font-weight: 500; transition: all 0.2s; padding: 0.2rem 0.5rem !important;
-    }
-    .stButton>button:hover { border-color: #22C55E; color: #22C55E; }
-    .stButton>button[kind="primary"] { background-color: #22C55E; color: #000; border: none; }
+    
+    /* 侧边栏 */
     [data-testid="stSidebar"] { background-color: #0F0F0F; border-right: 1px solid #262626; }
     
+    /* 开奖球（波色） */
     .ball-container { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
     .ball {
         display: inline-flex; align-items: center; justify-content: center;
-        width: 28px; height: 28px; border-radius: 50%;
-        font-weight: bold; font-size: 13px; box-shadow: 0 2px 4px rgba(0,0,0,0.3);
+        width: 32px; height: 32px; border-radius: 50%;
+        font-weight: bold; font-size: 14px; box-shadow: 0 2px 4px rgba(0,0,0,0.3);
     }
-    .ball-default { background-color: #1A1A1A; color: #FFF; border: 1px solid #555; }
     .ball-red { background-color: #7F1D1D; color: #FCA5A5; border: 1px solid #EF4444; }
     .ball-blue { background-color: #1E3A8A; color: #93C5FD; border: 1px solid #3B82F6; }
     .ball-green { background-color: #14532D; color: #86EFAC; border: 1px solid #22C55E; }
     .ball-special { box-shadow: 0 0 8px 1px rgba(255, 255, 255, 0.4); transform: scale(1.05); font-weight: 900; }
     
-    .huge-number { font-size: 28px; font-weight: 800; line-height: 1.1; }
+    /* 核心数据大数字 */
+    .huge-number { font-size: 36px; font-weight: 800; line-height: 1.1; }
     .profit { color: #22C55E; }
     .loss { color: #EF4444; }
-    .text-gray { color: #A3A3A3; font-size: 12px; }
-    .peak-text-pos { color: #22C55E; font-size: 12px; font-weight: bold; margin-top: 3px; }
-    .peak-text-neg { color: #EF4444; font-size: 12px; font-weight: bold; margin-top: 3px; }
+    .text-gray { color: #A3A3A3; font-size: 13px; }
+    .peak-text-pos { color: #22C55E; font-size: 13px; font-weight: bold; margin-top: 5px; }
+    .peak-text-neg { color: #EF4444; font-size: 13px; font-weight: bold; margin-top: 3px; }
     </style>
 """, unsafe_allow_html=True)
 
@@ -65,6 +64,7 @@ st.markdown("""
 try:
     DB_URL = st.secrets["DB_URL"]
 except:
+    # 如果你在本地跑，请填入真实密码
     DB_URL = "postgresql+psycopg2://postgres.ishhmayoclgbnwdwojim:你的真实密码@aws-0-ap-northeast-1.pooler.supabase.com:5432/postgres"
 
 @st.cache_resource
@@ -79,12 +79,12 @@ BLUE_BALLS = {3, 4, 9, 10, 14, 15, 20, 25, 26, 31, 36, 37, 41, 42, 47, 48}
 GREEN_BALLS = {5, 6, 11, 16, 17, 21, 22, 27, 28, 32, 33, 38, 39, 43, 44, 49}
 
 def get_ball_class(num, is_special=False):
-    base_class = "ball-default"
+    base_class = ""
     if num in RED_BALLS: base_class = "ball-red"
     elif num in BLUE_BALLS: base_class = "ball-blue"
     elif num in GREEN_BALLS: base_class = "ball-green"
-    if is_special: return f"{base_class} ball-special"
-    return base_class
+    if is_special: return f"ball {base_class} ball-special"
+    return f"ball {base_class}"
 
 def play_beep_sound():
     js = """
@@ -103,7 +103,7 @@ def play_beep_sound():
     """
     components.html(js, height=0, width=0)
 
-# ================= 🔄 数据更新逻辑 (全量扫描+真实时间) =================
+# ================= 🔄 自动补齐逻辑 =================
 LOTTERY_MAP = {
     "香港六合彩": {"code": "HK6", "type": "dpc"},
     "快乐8六合彩": {"code": "KLLHC", "type": "dpc"},
@@ -111,80 +111,61 @@ LOTTERY_MAP = {
     "加拿大六合彩": {"code": "JNDLHC", "type": "gpc"}
 }
 
-def update_latest_data(lottery_name, status_container=None):
+def auto_sync_data(lottery_name):
+    """静默同步最近30天数据，弥补断档"""
     config = LOTTERY_MAP.get(lottery_name)
-    if not config: return False, "未知彩种"
+    if not config: return False
     
-    # 💡 强行抓取 2026年1月1日 到 今天 的所有数据（六合彩一年才一百多期，抓取极快）
-    today = datetime.today()
-    start_date = datetime(2026, 1, 1).date()
-    end_date = today.date()
+    end_date = datetime.today().date()
+    start_date = end_date - timedelta(days=30)
+    delta_days = (end_date - start_date).days + 1
     
     all_new_data = []
+    headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://166w2.com/"}
     
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Referer": "https://166w2.com/"
-    }
-    
-    delta_days = (end_date - start_date).days + 1
-    debug_msgs = []
-
-    if status_container: status_container.info(f"正在请求 2026-01-01 至 {end_date} 的历史数据...")
-
     for day_offset in range(delta_days):
         target_date = start_date + timedelta(days=day_offset)
         y, m, d = target_date.strftime("%Y"), target_date.month, target_date.day
         
         if config["type"] == "dpc":
             url = f"https://data.kai8.us/api/lottery/history_dpc/KAI166/{config['code']}/{y}/{m}/{d}"
+            try:
+                res = requests.get(url, headers=headers, timeout=5)
+                if res.status_code == 200:
+                    for item in res.json().get("data", {}).get("list", []):
+                        all_new_data.append({"lottery_name": lottery_name, "issue": str(item.get("issue")).strip(), "draw_time": item.get("draw_time"), "draw_code": item.get("draw_code")})
+            except Exception: pass
+            time.sleep(0.02)
         else:
-            url = f"https://data.kai8.us/api/lottery/history_gpc/KAI166/{config['code']}/{y}-{m}-{d}/23/30"
-            
-        try:
-            res = requests.get(url, headers=headers, timeout=10)
-            if res.status_code == 200:
-                records = res.json().get("data", {}).get("list", [])
-                for item in records:
-                    all_new_data.append({
-                        "lottery_name": lottery_name, 
-                        "issue": str(item.get("issue")).strip(), 
-                        "draw_time": item.get("draw_time"), 
-                        "draw_code": item.get("draw_code")
-                    })
-            else:
-                debug_msgs.append(f"[{y}-{m}-{d}] HTTP {res.status_code}")
-        except Exception as e:
-            debug_msgs.append(f"[{y}-{m}-{d}] 异常")
-            
-        time.sleep(0.05) 
+            for h in range(24):
+                url = f"https://data.kai8.us/api/lottery/history_gpc/KAI166/{config['code']}/{y}-{m:02d}-{d:02d}/{h}/30"
+                try:
+                    res = requests.get(url, headers=headers, timeout=5)
+                    if res.status_code == 200:
+                        for item in res.json().get("data", {}).get("list", []):
+                            all_new_data.append({"lottery_name": lottery_name, "issue": str(item.get("issue")).strip(), "draw_time": item.get("draw_time"), "draw_code": item.get("draw_code")})
+                except Exception: pass
+                time.sleep(0.01)
 
-    if not all_new_data: 
-        if debug_msgs:
-            return False, f"⚠️ 接口请求失败: {', '.join(debug_msgs[:2])}..."
-        return False, "⚠️ 接口未返回任何数据"
-
+    if not all_new_data: return False
+    
     df_new = pd.DataFrame(all_new_data)
     df_new['issue'] = df_new['issue'].astype(str).str.strip()
     df_new['draw_time'] = pd.to_datetime(df_new['draw_time'], errors='coerce').dt.tz_localize(None)
-    df_new = df_new.dropna(subset=['draw_time'])
-    df_new = df_new.drop_duplicates(subset=['lottery_name', 'issue'], keep='first')
+    df_new = df_new.dropna(subset=['draw_time']).drop_duplicates(subset=['lottery_name', 'issue'], keep='first')
 
     try:
-        existing_issues = pd.read_sql(f"SELECT issue FROM lottery_data WHERE lottery_name = '{lottery_name}'", engine)['issue'].astype(str).str.strip().tolist()
-        df_new = df_new[~df_new['issue'].isin(existing_issues)]
+        existing = pd.read_sql(f"SELECT issue FROM lottery_data WHERE lottery_name = '{lottery_name}'", engine)['issue'].astype(str).str.strip().tolist()
+        df_new = df_new[~df_new['issue'].isin(existing)]
         
-        if df_new.empty:
-            # 找到了多少条，最新日期是几号
-            newest_time = pd.to_datetime(all_new_data[-1]['draw_time']).strftime('%Y-%m-%d') if all_new_data else "未知"
-            return False, f"已是最新 (全库无缺失。当前官网最新数据截止: {newest_time})"
-            
-        df_new.to_sql('lottery_data', engine, if_exists='append', index=False)
-        return True, f"✅ 成功补齐 {len(df_new)} 条新开奖！最新一期：{df_new.iloc[-1]['issue']} ({df_new.iloc[-1]['draw_time'].strftime('%Y-%m-%d')})"
-    except Exception as e:
-        return False, f"❌ 写入数据库失败: {e}"
+        if not df_new.empty:
+            df_new.to_sql('lottery_data', engine, if_exists='append', index=False)
+            return True
+    except Exception:
+        pass
+    return False
 
-# ================= 💾 方案保存逻辑 =================
+# ================= 💾 方案云端保存逻辑 =================
 def save_scheme_to_db(scheme):
     try:
         df = pd.DataFrame([{"id": scheme["id"], "scheme_json": json.dumps(scheme)}])
@@ -210,11 +191,14 @@ def load_schemes():
 
 if 'schemes' not in st.session_state: st.session_state.schemes = load_schemes() 
 if 'editing_id' not in st.session_state: st.session_state.editing_id = None
-if 'update_msg' not in st.session_state: st.session_state.update_msg = None
 
 if "chart_height" not in st.session_state: st.session_state.chart_height = int(st.query_params.get("chart_height", 350))
 if "pos_alert" not in st.session_state: st.session_state.pos_alert = float(st.query_params.get("pos_alert", 10000.0))
 if "neg_alert" not in st.session_state: st.session_state.neg_alert = float(st.query_params.get("neg_alert", -5000.0))
+if "auto_sync" not in st.session_state: st.session_state.auto_sync = st.query_params.get("auto_sync") == "true"
+if "auto_interval" not in st.session_state:
+    try: st.session_state.auto_interval = int(st.query_params.get("auto_interval", 60))
+    except ValueError: st.session_state.auto_interval = 60
 
 def sync_alerts_to_url():
     st.query_params["pos_alert"] = str(st.session_state.pos_alert)
@@ -239,9 +223,8 @@ month_start = today - timedelta(days=30)
 
 if btn_col1.button("今天", use_container_width=True): st.session_state.date_range = (today, today)
 if btn_col2.button("近30天", use_container_width=True): st.session_state.date_range = (month_start, today)
-if btn_col3.button("本年", use_container_width=True): st.session_state.date_range = (datetime(2026,1,1).date(), today)
+if btn_col3.button("本年", use_container_width=True): st.session_state.date_range = (datetime(today.year,1,1).date(), today)
 
-# 💡 默认时间范围改为最近30天，确保你一打开就能看到最新的数据
 if 'date_range' not in st.session_state: st.session_state.date_range = (month_start, today)
 start_date = st.sidebar.date_input("开始日期", value=st.session_state.date_range[0])
 end_date = st.sidebar.date_input("结束日期", value=st.session_state.date_range[1])
@@ -377,13 +360,19 @@ if st.session_state.schemes:
 # ================= 3. 主界面：控制台 =================
 st.markdown(f"<h2 style='font-size: 20px; display:inline-block;'>📊 历史盈亏回测</h2> <span style='font-size:12px;color:#A3A3A3;margin-left:10px;'>范围: {start_date} 至 {end_date}</span>", unsafe_allow_html=True)
 
-status_box = st.empty()
-
-c_lottery, c_time = st.columns([1.5, 2.5])
+c_lottery, c_action = st.columns([1.5, 2.5])
 with c_lottery:
     selected_lottery = st.selectbox("🎯 目标彩种", available_lotteries)
+    
     is_high_freq = ("宾果" in selected_lottery or "加拿大" in selected_lottery)
     
+    # 💡 核心：打开网页或切换彩种时，自动静默补齐最近30天数据
+    cache_key = f"synced_{selected_lottery}"
+    if cache_key not in st.session_state:
+        with st.spinner("正在后台自动补齐近期数据..."):
+            auto_sync_data(selected_lottery)
+        st.session_state[cache_key] = True
+
     try:
         query = f"SELECT issue as 期号, draw_time as 开奖日期, draw_code as 开奖号码 FROM lottery_data WHERE lottery_name = '{selected_lottery}'"
         df_all = pd.read_sql(query, engine)
@@ -394,8 +383,31 @@ with c_lottery:
         st.error(f"读取图表数据失败: {e}")
         df_all = pd.DataFrame()
 
-with c_time:
-    time_filter = st.text_input("🕒 时间过滤(可选)", value="", placeholder="例: 08:20") if is_high_freq else ""
+with c_action:
+    if is_high_freq:
+        st.markdown("<div style='margin-top: 10px;'></div>", unsafe_allow_html=True)
+        # 自动同步开关控制
+        if not st.session_state.auto_sync:
+            if st.button("▶️ 开启页面自动更新 (每60秒)", use_container_width=True, type="primary"):
+                st.session_state.auto_sync = True
+                st.query_params["auto_sync"] = "true"
+                st.rerun()
+        else:
+            if st.button("⏸️ 暂停自动更新", use_container_width=True):
+                st.session_state.auto_sync = False
+                if "auto_sync" in st.query_params: del st.query_params["auto_sync"]
+                st.rerun()
+
+# 💡 JS 定时刷新（仅在开启自动更新且为高频彩时生效）
+if st.session_state.auto_sync and is_high_freq:
+    js = f"""
+    <script>
+    setTimeout(function(){{
+        window.parent.location.reload();
+    }}, {st.session_state.auto_interval * 1000});
+    </script>
+    """
+    components.html(js, height=0, width=0)
 
 if not df_all.empty:
     latest_row = df_all.iloc[-1]
@@ -403,42 +415,14 @@ if not df_all.empty:
     latest_normals, latest_special = parse_draw(latest_row)
     
     if latest_normals:
-        balls_html = "".join([f"<div class='ball {get_ball_class(n)}'>{n:02d}</div>" for n in latest_normals])
-        balls_html += f"<div class='ball {get_ball_class(latest_special, True)}'>{latest_special:02d}</div>"
+        balls_html = "".join([f"<div class='{get_ball_class(n)}'>{n:02d}</div>" for n in latest_normals])
+        balls_html += f"<div class='{get_ball_class(latest_special, True)}'>{latest_special:02d}</div>"
         st.markdown(f"""
         <div style="background-color: #121212; border: 1px solid #262626; border-radius: 6px; padding: 8px 12px; margin-top: 5px; margin-bottom: 10px; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px;">
             <div><span style="color: #FFF; font-weight: bold; font-size: 14px;">第 {latest_issue} 期</span><span style="color: #666; font-size: 12px; margin-left: 10px;">{latest_date}</span></div>
             <div class="ball-container">{balls_html}</div>
         </div>
         """, unsafe_allow_html=True)
-
-with st.expander("🔄 数据更新", expanded=True):
-    c_sync1, c_sync2 = st.columns([1.5, 3.5])
-    with c_sync1:
-        if st.button("🔄 点击补齐最新开奖数据", use_container_width=True, type="primary"):
-            with st.spinner("正在请求接口..."):
-                success, msg = update_latest_data(selected_lottery, status_box)
-                st.session_state.update_msg = ("success" if success else "error", msg)
-                st.rerun()
-    with c_sync2:
-        if st.session_state.update_msg:
-            status, msg = st.session_state.update_msg
-            if status == "success": st.success(msg, icon="✅")
-            else: st.error(msg, icon="❌")
-            st.session_state.update_msg = None
-        else:
-            st.info("每次点击将从2026年1月1日全量扫描至今。")
-
-if is_high_freq:
-    with st.expander("⚙️ 报警线设置与图表调节", expanded=False):
-        c_alert1, c_alert2 = st.columns(2)
-        with c_alert1: st.number_input("📈 正峰值报警线 (元) - 止盈", step=1000.0, key="pos_alert", on_change=sync_alerts_to_url)
-        with c_alert2: st.number_input("📉 负峰值报警线 (元) - 止损", step=-1000.0, key="neg_alert", on_change=sync_alerts_to_url)
-        new_height = st.slider("图表高度", min_value=250, max_value=900, value=st.session_state.chart_height, step=50)
-        if new_height != st.session_state.chart_height:
-            st.session_state.chart_height = new_height
-            st.query_params["chart_height"] = str(new_height)
-            st.rerun()
 
 # ================= 4. 计算引擎 =================
 def calculate_scheme(df, scheme, time_filter=""):
@@ -529,7 +513,7 @@ else:
     
     all_res_dfs = []
     for scheme in active_schemes:
-        res = calculate_scheme(df_filtered, scheme, time_filter)
+        res = calculate_scheme(df_filtered, scheme, time_filter="")
         if not res.empty:
             res['方案名称'] = scheme['name']
             all_res_dfs.append(res)
@@ -597,7 +581,7 @@ else:
     tabs = st.tabs([s['name'] for s in active_schemes])
     for idx, scheme in enumerate(active_schemes):
         with tabs[idx]:
-            res_df = calculate_scheme(df_filtered, scheme, time_filter)
+            res_df = calculate_scheme(df_filtered, scheme, time_filter="")
             if res_df.empty: continue
             
             total_pl = res_df['本期盈亏'].sum()
