@@ -26,7 +26,6 @@ st.markdown("""
     label { color: #A3A3A3 !important; font-size: 12px !important; padding-bottom: 0px !important; }
     [data-testid="stSidebar"] { background-color: #0F0F0F; border-right: 1px solid #262626; }
     
-    /* 开奖球（波色样式） */
     .ball-container { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
     .ball { display: inline-flex; align-items: center; justify-content: center; width: 32px; height: 32px; border-radius: 50%; font-weight: bold; font-size: 14px; box-shadow: 0 2px 4px rgba(0,0,0,0.3); }
     .ball-red { background-color: #7F1D1D; color: #FCA5A5; border: 1px solid #EF4444; }
@@ -34,7 +33,6 @@ st.markdown("""
     .ball-green { background-color: #14532D; color: #86EFAC; border: 1px solid #22C55E; }
     .ball-special { box-shadow: 0 0 8px 1px rgba(255, 255, 255, 0.4); transform: scale(1.05); font-weight: 900; }
     
-    /* 核心数据大数字 */
     .huge-number { font-size: 36px; font-weight: 800; line-height: 1.1; }
     .profit { color: #22C55E; }
     .loss { color: #EF4444; }
@@ -185,7 +183,7 @@ if 'schemes' not in st.session_state:
 if 'editing_id' not in st.session_state: 
     st.session_state.editing_id = None
 
-# 💡 URL 记忆 (报警线默认改为 0)
+# URL 记忆
 if "chart_height" not in st.session_state: st.session_state.chart_height = int(st.query_params.get("chart_height", 350))
 if "dtick_val" not in st.session_state: st.session_state.dtick_val = int(st.query_params.get("dtick_val", 10000))
 if "pos_alert" not in st.session_state: st.session_state.pos_alert = float(st.query_params.get("pos_alert", 0.0))
@@ -421,8 +419,12 @@ with st.expander("报警线设置与图表调节", expanded=False):
             st.query_params["dtick_val"] = str(new_dtick)
             st.rerun()
 
-# ================= 4. 计算引擎 =================
-def calculate_scheme(df, scheme, time_filter=""):
+# 💡 核心优化：加入缓存机制，避免重复计算卡死页面
+@st.cache_data(show_spinner=False)
+def calculate_scheme(df_json, scheme_json, time_filter=""):
+    df = pd.read_json(df_json)
+    scheme = json.loads(scheme_json)
+    
     cat, sub = scheme['category'], scheme['sub_type']
     if cat == "特码类": bet_count = len(scheme['numbers'])
     elif cat == "连码复式":
@@ -495,7 +497,7 @@ def calculate_scheme(df, scheme, time_filter=""):
         
     res_df = pd.DataFrame(results)
     if not res_df.empty: res_df['累计盈亏'] = res_df['本期盈亏'].cumsum()
-    return res_df
+    return res_df.to_json()
 
 # ================= 5. 测算结果展示 =================
 if not active_schemes:
@@ -508,13 +510,35 @@ else:
         
     df_filtered["正码"], df_filtered["特码"] = zip(*df_filtered.apply(parse_draw, axis=1))
     
+    # 将 DataFrame 转为 json 传给带缓存的函数
+    df_json = df_filtered.to_json()
+    
+    # 💡 进度条初始化
+    total_schemes = len(active_schemes)
+    progress_text = "正在计算历史盈亏..."
+    my_bar = st.progress(0, text=progress_text)
+    
+    scheme_results = {}
     all_res_dfs = []
-    for scheme in active_schemes:
-        res = calculate_scheme(df_filtered, scheme, time_filter="")
+    
+    for i, scheme in enumerate(active_schemes):
+        scheme_json = json.dumps(scheme)
+        res_json = calculate_scheme(df_json, scheme_json, "")
+        res = pd.read_json(res_json)
+        
+        scheme_results[scheme['id']] = res
+        
         if not res.empty:
             res['方案名称'] = scheme['name']
+            res['开奖日期'] = pd.to_datetime(res['开奖日期'])
             all_res_dfs.append(res)
             
+        # 💡 更新进度条
+        pct = int((i + 1) / total_schemes * 100)
+        my_bar.progress((i + 1) / total_schemes, text=f"正在计算: {scheme['name']} ({pct}%)")
+        
+    my_bar.empty() # 算完后清除进度条
+    
     if not all_res_dfs:
         st.warning("当前过滤条件下无数据。")
         st.stop()
@@ -523,14 +547,12 @@ else:
     merged_pl = combined_df.groupby(['期号', '开奖日期']).agg({'命中注数': 'sum', '本期盈亏': 'sum'}).reset_index()
     merged_pl['累计盈亏'] = merged_pl['本期盈亏'].cumsum()
     total_combined_pl = merged_pl['本期盈亏'].sum()
-    
-    # 💡 提取历史最高/最低点用于图表标记
+
     peak_value = merged_pl['累计盈亏'].max()
     peak_issue = merged_pl.loc[merged_pl['累计盈亏'].idxmax(), '期号']
     low_peak_value = merged_pl['累计盈亏'].min()
     low_peak_issue = merged_pl.loc[merged_pl['累计盈亏'].idxmin(), '期号']
     
-    # 💡 提取最新一期的累计盈亏，用于报警判断
     latest_pl = merged_pl.iloc[-1]['累计盈亏']
     
     alert_pos_val = st.session_state.pos_alert
@@ -586,8 +608,9 @@ else:
     tabs = st.tabs([s['name'] for s in active_schemes])
     for idx, scheme in enumerate(active_schemes):
         with tabs[idx]:
-            res_df = calculate_scheme(df_filtered, scheme, time_filter="")
-            if res_df.empty: continue
+            # 💡 核心优化：这里直接从内存字典里取，绝不重复计算
+            res_df = scheme_results.get(scheme['id'])
+            if res_df is None or res_df.empty: continue
             
             total_pl = res_df['本期盈亏'].sum()
             win_periods = len(res_df[res_df['命中注数'] > 0])
