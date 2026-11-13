@@ -8,7 +8,6 @@ import json
 import requests
 import time
 from datetime import datetime, timedelta
-from concurrent.futures import ThreadPoolExecutor
 import streamlit.components.v1 as components
 from sqlalchemy import create_engine, text
 
@@ -104,21 +103,13 @@ def play_beep_sound():
     """
     components.html(js, height=0, width=0)
 
-# ================= 🔄 数据抓取逻辑 (极速双接口) =================
+# ================= 🔄 100% 还原你的本地抓取逻辑 =================
 LOTTERY_MAP = {
     "香港六合彩": {"code": "HK6", "type": "dpc"},
     "快乐8六合彩": {"code": "KLLHC", "type": "dpc"},
     "宾果六合彩": {"code": "TWBGLHC", "type": "gpc"},
     "加拿大六合彩": {"code": "JNDLHC", "type": "gpc"}
 }
-
-def fetch_api(url, headers):
-    try:
-        res = requests.get(url, headers=headers, timeout=5)
-        if res.status_code == 200:
-            return res.json().get("data", {}).get("list", [])
-    except Exception: pass
-    return []
 
 def update_latest_data(lottery_name, status_container=None):
     config = LOTTERY_MAP.get(lottery_name)
@@ -128,11 +119,9 @@ def update_latest_data(lottery_name, status_container=None):
     try:
         df_old = pd.read_sql(f"SELECT issue, draw_time FROM lottery_data WHERE lottery_name = '{lottery_name}' ORDER BY draw_time DESC LIMIT 1", engine)
         if df_old.empty:
-            # 💡 如果库是空的，直接抓最近 30 天
             start_date = datetime.today().date() - timedelta(days=30) 
         else:
             max_date = pd.to_datetime(df_old.iloc[0]['draw_time']).date()
-            # 💡 从库里的最新日期开始抓，确保补全
             start_date = max_date
     except Exception as e:
         return False, f"❌ 读取数据库失败: {e}"
@@ -141,43 +130,47 @@ def update_latest_data(lottery_name, status_container=None):
     if start_date > end_date: return False, "已是最新"
     
     all_new_data = []
-    headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://166kai.com/"}
+    
+    # 💡 彻底还原旧代码请求头
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Referer": "https://166w2.com/"
+    }
+    
     delta_days = (end_date - start_date).days + 1
+    debug_msgs = [] # 用于收集报错信息
 
-    if config["type"] == "dpc":
-        if status_container: status_container.info("正在按天抓取数据...")
-        for day_offset in range(delta_days):
-            target_date = start_date + timedelta(days=day_offset)
-            y, m, d = target_date.strftime("%Y"), target_date.month, target_date.day
+    for day_offset in range(delta_days):
+        target_date = start_date + timedelta(days=day_offset)
+        y, m, d = target_date.strftime("%Y"), target_date.month, target_date.day
+        
+        if config["type"] == "dpc":
+            # 💡 彻底还原旧代码URL (不补零)
+            url = f"https://data.kai8.us/api/lottery/history_dpc/KAI166/{config['code']}/{y}/{m}/{d}"
+        else:
+            # 💡 彻底还原旧代码URL (23/30)
+            url = f"https://data.kai8.us/api/lottery/history_gpc/KAI166/{config['code']}/{y}-{m}-{d}/23/30"
             
-            # 💡 强制使用 api68 接口，专治海外无法抓取的问题
-            date_str = f"{y}-{m:02d}-{d:02d}"
-            url = f"https://api.api68.com/pks/getPksHistoryList.do?date={date_str}&lotCode={config['code']}"
-            records = fetch_api(url, headers)
-            
-            for item in records:
-                issue = str(item.get("preDrawIssue") or item.get("issue")).strip()
-                draw_time = item.get("preDrawTime") or item.get("draw_time")
-                draw_code = item.get("preDrawCode") or item.get("draw_code")
-                all_new_data.append({"lottery_name": lottery_name, "issue": issue, "draw_time": draw_time, "draw_code": draw_code})
-    else:
-        # 高频彩：按小时并发
-        if status_container: status_container.info("正在通过高频通道极速抓取...")
-        urls_to_fetch = []
-        for day_offset in range(delta_days):
-            target_date = start_date + timedelta(days=day_offset)
-            y, m, d = target_date.strftime("%Y"), target_date.month, target_date.day
-            for h in range(24):
-                url = f"https://data.kai8.us/api/lottery/history_gpc/KAI166/{config['code']}/{y}-{m:02d}-{d:02d}/{h}/30"
-                urls_to_fetch.append(url)
-                
-        with ThreadPoolExecutor(max_workers=10) as executor:
-            results = executor.map(lambda u: fetch_api(u, headers), urls_to_fetch)
-            for records in results:
+        try:
+            res = requests.get(url, headers=headers, timeout=10)
+            if res.status_code == 200:
+                records = res.json().get("data", {}).get("list", [])
                 for item in records:
-                    all_new_data.append({"lottery_name": lottery_name, "issue": str(item.get("issue")).strip(), "draw_time": item.get("draw_time"), "draw_code": item.get("draw_code")})
+                    all_new_data.append({
+                        "lottery_name": lottery_name, 
+                        "issue": str(item.get("issue")).strip(), 
+                        "draw_time": item.get("draw_time"), 
+                        "draw_code": item.get("draw_code")
+                    })
+            else:
+                debug_msgs.append(f"[{y}-{m}-{d}] HTTP {res.status_code}")
+        except Exception as e:
+            debug_msgs.append(f"[{y}-{m}-{d}] 异常: {str(e)[:20]}")
 
-    if not all_new_data: return False, "⚠️ 接口未返回新数据 (可能接口已失效)"
+    if not all_new_data: 
+        if debug_msgs:
+            return False, f"⚠️ 接口请求失败，原因: {', '.join(debug_msgs[:2])}..."
+        return False, "⚠️ 接口返回空 (可能是海外IP被拦截或日期错误)"
     
     df_new = pd.DataFrame(all_new_data)
     df_new['issue'] = df_new['issue'].astype(str).str.strip()
@@ -193,7 +186,7 @@ def update_latest_data(lottery_name, status_container=None):
         df_new = df_new[~df_new['issue'].isin(existing_issues)]
         
         if df_new.empty:
-            return False, f"库内已有，没有新增 (抓到了{len(all_new_data)}条，但都重复了)"
+            return False, "已是最新 (抓到的数据均已存在)"
             
         df_new.to_sql('lottery_data', engine, if_exists='append', index=False)
         return True, f"✅ 抓取完成！成功写入 {len(df_new)} 条新开奖"
