@@ -10,6 +10,7 @@ import time
 from datetime import datetime, timedelta
 import streamlit.components.v1 as components
 from sqlalchemy import create_engine, text
+from streamlit_autorefresh import st_autorefresh # 💡 引入自动刷新库
 
 # ================= 🎨 页面配置与 UI CSS =================
 st.set_page_config(page_title="数据量化终端", layout="wide", page_icon="📊")
@@ -196,11 +197,10 @@ def load_schemes():
     except:
         return []
 
-# 💡 每次加载页面，都从数据库实时拉取最新方案
 if 'schemes' not in st.session_state: st.session_state.schemes = load_schemes() 
 if 'editing_id' not in st.session_state: st.session_state.editing_id = None
 
-# 💡 URL 状态记忆（解决刷新丢失问题）
+# 💡 URL 记忆
 if "chart_height" not in st.session_state: st.session_state.chart_height = int(st.query_params.get("chart_height", 350))
 if "pos_alert" not in st.session_state: st.session_state.pos_alert = float(st.query_params.get("pos_alert", 10000.0))
 if "neg_alert" not in st.session_state: st.session_state.neg_alert = float(st.query_params.get("neg_alert", -5000.0))
@@ -333,7 +333,7 @@ def render_scheme_row(s):
     is_active = c1.checkbox(s['name'], value=s['active'], key=f"chk_{s['id']}")
     if is_active != s['active']: 
         s['active'] = is_active
-        save_scheme_to_db(s) # 💡 核心修复：勾选状态立刻存库，刷新不丢
+        save_scheme_to_db(s) # 💡 勾选立刻存库
     if c2.button("改", key=f"e_{s['id']}"): st.session_state.editing_id = s['id']; st.rerun()
     if c3.button("删", key=f"d_{s['id']}"):
         st.session_state.schemes = [x for x in st.session_state.schemes if x['id'] != s['id']]
@@ -357,7 +357,7 @@ if st.session_state.schemes:
                 if new_group_active != group_active:
                     for s in s_list: 
                         s['active'] = new_group_active
-                        save_scheme_to_db(s) # 💡 核心修复
+                        save_scheme_to_db(s) 
                     st.rerun()
                 with st.expander(f"🔽 查看 {g_name} 内的 {len(s_list)} 个方案", expanded=False):
                     for s in s_list: render_scheme_row(s)
@@ -368,10 +368,14 @@ st.markdown(f"<h2 style='font-size: 20px; display:inline-block;'>📊 历史盈�
 c_lottery, c_action = st.columns([1.5, 2.5])
 with c_lottery:
     selected_lottery = st.selectbox("🎯 目标彩种", available_lotteries)
-    st.query_params["lottery"] = selected_lottery # 💡 记忆选中的彩种
+    st.query_params["lottery"] = selected_lottery 
     
     is_high_freq = ("宾果" in selected_lottery or "加拿大" in selected_lottery)
     
+    # 💡 自动刷新机制：如果是高频彩，开启自动刷新，每 60 秒刷新一次
+    if is_high_freq:
+        st_autorefresh(interval=60000, limit=None, key="high_freq_refresh")
+        
     cache_key = f"synced_{selected_lottery}"
     if cache_key not in st.session_state:
         auto_sync_data(selected_lottery)
@@ -389,11 +393,9 @@ with c_lottery:
 
 with c_action:
     st.markdown("<div style='margin-top: 10px;'></div>", unsafe_allow_html=True)
-    if is_high_freq:
-        # 💡 自动刷新模块
-        if st.button("⚡ 极速刷新最新数据 (并刷新图表)", use_container_width=True, type="primary"):
-            auto_sync_data(selected_lottery)
-            st.rerun()
+    if st.button("⚡ 立即手动刷新数据", use_container_width=True, type="primary"):
+        auto_sync_data(selected_lottery)
+        st.rerun()
 
 if not df_all.empty:
     latest_row = df_all.iloc[-1]
@@ -532,7 +534,7 @@ else:
     alert_pos_triggered = peak_value >= st.session_state.pos_alert
     alert_neg_triggered = low_peak_value <= st.session_state.neg_alert
     
-    # 💡 触发语音和弹窗报警
+    # 💡 语音报警
     if alert_pos_triggered or alert_neg_triggered:
         play_beep_sound()
         if alert_pos_triggered and alert_neg_triggered:
