@@ -63,8 +63,10 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ================= 🗄️ 云端数据库配置 =================
-# 部署到 Streamlit Cloud 时，通过 Secrets 读取
-DB_URL = st.secrets["DB_URL"]
+try:
+    DB_URL = st.secrets["DB_URL"]
+except:
+    DB_URL = "postgresql+psycopg2://postgres.ishhmayoclgbnwdwojim:你的真实密码@aws-0-ap-northeast-1.pooler.supabase.com:5432/postgres"
 
 @st.cache_resource
 def get_db_engine():
@@ -104,8 +106,8 @@ def play_beep_sound():
 
 # ================= 🔄 数据抓取逻辑 =================
 LOTTERY_MAP = {
-    "香港六合彩": {"code": "HK6", "type": "dpc"},
-    "快乐8六合彩": {"code": "KLLHC", "type": "dpc"},
+    "香港六合彩": {"code": "HK6", "type": "dpc", "draw_hour": 21},
+    "快乐8六合彩": {"code": "KLLHC", "type": "dpc", "draw_hour": 21},
     "宾果六合彩": {"code": "TWBGLHC", "type": "gpc"},
     "加拿大六合彩": {"code": "JNDLHC", "type": "gpc"}
 }
@@ -126,29 +128,39 @@ def update_latest_data(lottery_name, status_container=None):
     try:
         df_old = pd.read_sql(f"SELECT issue, draw_time FROM lottery_data WHERE lottery_name = '{lottery_name}' ORDER BY draw_time DESC LIMIT 1", engine)
         if df_old.empty:
-            start_date = datetime.today().date() - timedelta(days=3) 
+            # 如果是空表，首次建仓，抓最近 30 天
+            start_date = datetime.today().date() - timedelta(days=30) 
         else:
             max_date = pd.to_datetime(df_old.iloc[0]['draw_time']).date()
-            start_date = max_date - timedelta(days=1)
+            start_date = max_date
     except Exception as e:
-        return False, f"❌ 数据库连接失败: {e}"
+        return False, f"❌ 读取数据库失败: {e}"
 
     end_date = datetime.today().date()
     if start_date > end_date: return False, "已是最新"
     
     all_new_data = []
-    headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://166kai.com/"}
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", "Referer": "https://166kai.com/"}
     delta_days = (end_date - start_date).days + 1
 
     if config["type"] == "dpc":
+        # 传统彩：按天循环（断档几天就循环几天）
         for day_offset in range(delta_days):
             target_date = start_date + timedelta(days=day_offset)
             y, m, d = target_date.strftime("%Y"), target_date.month, target_date.day
-            url = f"https://data.kai8.us/api/lottery/history_dpc/KAI166/{config['code']}/{y}/{m}/{d}"
+            url = f"https://api.api68.com/pks/getPksHistoryList.do?date={y}-{m:02d}-{d:02d}&lotCode={config['code']}"
             records = fetch_api(url, headers)
+            if not records:
+                url2 = f"https://data.kai8.us/api/lottery/history_dpc/KAI166/{config['code']}/{y}/{m}/{d}"
+                records = fetch_api(url2, headers)
+            
             for item in records:
-                all_new_data.append({"lottery_name": lottery_name, "issue": str(item.get("issue")).strip(), "draw_time": item.get("draw_time"), "draw_code": item.get("draw_code")})
+                issue = str(item.get("preDrawIssue") or item.get("issue")).strip()
+                draw_time = item.get("preDrawTime") or item.get("draw_time")
+                draw_code = item.get("preDrawCode") or item.get("draw_code")
+                all_new_data.append({"lottery_name": lottery_name, "issue": issue, "draw_time": draw_time, "draw_code": draw_code})
     else:
+        # 高频彩：按小时并发循环
         if status_container: status_container.info("正在通过高频通道极速抓取...")
         urls_to_fetch = []
         for day_offset in range(delta_days):
@@ -172,11 +184,10 @@ def update_latest_data(lottery_name, status_container=None):
     df_new = df_new.dropna(subset=['draw_time'])
     df_new = df_new.drop_duplicates(subset=['lottery_name', 'issue'], keep='first')
     
-    if df_new.empty: return False, "⚠️ 抓到的数据无效，已跳过。"
+    if df_new.empty: return False, "⚠️ 数据无效，已跳过。"
 
-    if status_container: status_container.info("正在写入数据库 (自动跳过重复)...")
+    if status_container: status_container.info(f"正在写入 {len(df_new)} 条数据...")
     
-    # 使用 ON CONFLICT DO NOTHING 语法，遇到重复直接忽略，绝不报错
     try:
         records = df_new.to_dict('records')
         sql = text("""
@@ -184,24 +195,28 @@ def update_latest_data(lottery_name, status_container=None):
             VALUES (:lottery_name, :issue, :draw_time, :draw_code)
             ON CONFLICT (lottery_name, issue) DO NOTHING
         """)
-        
         with engine.begin() as conn:
             conn.execute(sql, records)
-            
-        return True, f"✅ 抓取完成！已同步至云端 (自动跳过重复项)"
+        return True, f"✅ 抓取完成！已同步至云端"
     except Exception as e:
         return False, f"❌ 写入数据库失败: {e}"
 
 # ================= 💾 方案保存逻辑 =================
-def save_schemes():
+def save_scheme_to_db(scheme):
     try:
-        df = pd.DataFrame([{"id": s["id"], "scheme_json": json.dumps(s)} for s in st.session_state.schemes])
+        df = pd.DataFrame([{"id": scheme["id"], "scheme_json": json.dumps(scheme)}])
         with engine.begin() as conn:
-            conn.execute(text("DELETE FROM saved_schemes"))
-        if not df.empty:
+            conn.execute(text("DELETE FROM saved_schemes WHERE id = :id"), {"id": scheme["id"]})
             df.to_sql('saved_schemes', engine, if_exists='append', index=False)
     except Exception as e:
         st.error(f"方案保存云端失败: {e}")
+
+def delete_scheme_from_db(scheme_id):
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("DELETE FROM saved_schemes WHERE id = :id"), {"id": scheme_id})
+    except Exception as e:
+        st.error(f"方案删除失败: {e}")
 
 def load_schemes():
     try:
@@ -226,7 +241,6 @@ def sync_alerts_to_url():
 available_lotteries = list(LOTTERY_MAP.keys())
 
 def parse_draw(row):
-    # 兼容来自 API 的 draw_code 列或数据库读取出的中文列名
     code_str = str(row["draw_code"]) if "draw_code" in row else str(row["开奖号码"])
     nums = [int(x) for x in code_str.replace('"', '').replace("'", "").split(",") if x.strip().isdigit()]
     if len(nums) >= 7: return sorted(nums[:6]), nums[-1]
@@ -333,7 +347,7 @@ with st.sidebar.expander(form_title, expanded=is_editing):
                 st.session_state.editing_id = None
             else:
                 st.session_state.schemes.append(new_scheme)
-            save_schemes()
+            save_scheme_to_db(new_scheme) 
             st.rerun()
         except: st.error("号码格式有误！")
     if is_editing:
@@ -345,11 +359,14 @@ active_schemes = []
 def render_scheme_row(s):
     c1, c2, c3 = st.columns([3, 1, 1])
     is_active = c1.checkbox(s['name'], value=s['active'], key=f"chk_{s['id']}")
-    if is_active != s['active']: s['active'] = is_active; save_schemes()
+    if is_active != s['active']: 
+        s['active'] = is_active
+        save_scheme_to_db(s) 
     if c2.button("改", key=f"e_{s['id']}"): st.session_state.editing_id = s['id']; st.rerun()
     if c3.button("删", key=f"d_{s['id']}"):
         st.session_state.schemes = [x for x in st.session_state.schemes if x['id'] != s['id']]
-        save_schemes(); st.rerun()
+        delete_scheme_from_db(s['id']) 
+        st.rerun()
     if s['active']: active_schemes.append(s)
 
 if st.session_state.schemes:
@@ -366,8 +383,10 @@ if st.session_state.schemes:
                 group_active = all(s['active'] for s in s_list)
                 new_group_active = st.checkbox(f"📦 {g_name}", value=group_active, key=f"grp_{g_name}")
                 if new_group_active != group_active:
-                    for s in s_list: s['active'] = new_group_active
-                    save_schemes(); st.rerun()
+                    for s in s_list: 
+                        s['active'] = new_group_active
+                        save_scheme_to_db(s)
+                    st.rerun()
                 with st.expander(f"🔽 查看 {g_name} 内的 {len(s_list)} 个方案", expanded=False):
                     for s in s_list: render_scheme_row(s)
 
@@ -381,14 +400,28 @@ with c_lottery:
     selected_lottery = st.selectbox("🎯 目标彩种", available_lotteries)
     is_high_freq = ("宾果" in selected_lottery or "加拿大" in selected_lottery)
     
+    # 💡 核心：判断是否触发自动抓取
+    now = datetime.now()
+    trigger_auto_fetch = False
+    
     if is_high_freq:
-        if "last_checked" not in st.session_state or st.session_state.get("last_lottery") != selected_lottery or (datetime.now() - st.session_state.last_checked).total_seconds() > 30:
-            with st.spinner("云端极速并发获取数据中..."):
-                success, msg = update_latest_data(selected_lottery, status_box)
-                st.session_state.last_checked = datetime.now()
-                st.session_state.last_lottery = selected_lottery
-                if success: status_box.success(msg)
-                else: status_box.warning(msg)
+        # 高频彩：只要间隔超过30秒就抓
+        if "last_checked" not in st.session_state or st.session_state.get("last_lottery") != selected_lottery or (now - st.session_state.last_checked).total_seconds() > 30:
+            trigger_auto_fetch = True
+    else:
+        # 传统彩 (香港/快乐8)：每天晚上 21:30 之后触发
+        draw_hour = LOTTERY_MAP[selected_lottery].get("draw_hour", 21)
+        if now.hour >= draw_hour or now.hour < 2: # 比如晚上21:30以后，或者凌晨(防止跨天没抓到)
+            if "last_checked" not in st.session_state or st.session_state.get("last_lottery") != selected_lottery or (now - st.session_state.last_checked).total_seconds() > 3600:
+                trigger_auto_fetch = True
+
+    if trigger_auto_fetch:
+        with st.spinner(f"正在自动补全 {selected_lottery} 数据..."):
+            success, msg = update_latest_data(selected_lottery, status_box)
+            st.session_state.last_checked = now
+            st.session_state.last_lottery = selected_lottery
+            if success: status_box.success(msg)
+            elif "已是最新" not in msg: status_box.warning(msg)
 
     try:
         query = f"SELECT issue as 期号, draw_time as 开奖日期, draw_code as 开奖号码 FROM lottery_data WHERE lottery_name = '{selected_lottery}'"
@@ -418,11 +451,12 @@ if not df_all.empty:
         </div>
         """, unsafe_allow_html=True)
 
+# 手动更新按钮区
 if not is_high_freq:
-    with st.expander("🔄 手动数据更新", expanded=True):
+    with st.expander("🔄 传统彩数据更新 (香港/快乐8)", expanded=True):
         c_sync1, c_sync2 = st.columns([1.5, 3.5])
         with c_sync1:
-            if st.button("🔄 点击获取最新开奖数据", use_container_width=True, type="primary"):
+            if st.button("🔄 点击强制获取最新数据", use_container_width=True, type="primary"):
                 with st.spinner("正在请求接口..."):
                     success, msg = update_latest_data(selected_lottery, status_box)
                     st.session_state.update_msg = ("success" if success else "error", msg)
@@ -434,9 +468,9 @@ if not is_high_freq:
                 else: st.error(msg, icon="❌")
                 st.session_state.update_msg = None
             else:
-                st.info("香港六合彩与快乐8每日开奖频率低，建议手动点击获取。")
+                st.info("每天 21:30 后打开网页会自动补齐当日数据，也可以手动点击强制更新。")
 else:
-    with st.expander("⚙️ 高频彩自动更新 与 报警线设置", expanded=False):
+    with st.expander("⚙️ 报警线设置与图表调节", expanded=False):
         c_alert1, c_alert2 = st.columns(2)
         with c_alert1: st.number_input("📈 正峰值报警线 (元) - 止盈", step=1000.0, key="pos_alert", on_change=sync_alerts_to_url)
         with c_alert2: st.number_input("📉 负峰值报警线 (元) - 止损", step=-1000.0, key="neg_alert", on_change=sync_alerts_to_url)
