@@ -148,7 +148,7 @@ def auto_sync_data(lottery_name):
     except Exception: pass
     return False
 
-# ================= 💾 方案云端保存 (完美兼容版) =================
+# ================= 💾 方案云端保存 =================
 def save_scheme_to_db(scheme):
     try:
         df = pd.DataFrame([{"id": scheme["id"], "scheme_json": json.dumps(scheme)}])
@@ -171,30 +171,25 @@ def load_schemes():
     try:
         df = pd.read_sql("SELECT scheme_json FROM saved_schemes", engine)
         if df.empty: return []
-        
         schemes = []
         for row in df['scheme_json']:
-            # 💡 核心修复：兼容旧数据库存进去的 Dict 和 Str 两种格式
-            if isinstance(row, dict):
-                schemes.append(row)
-            elif isinstance(row, str):
-                schemes.append(json.loads(row))
+            if isinstance(row, dict): schemes.append(row)
+            elif isinstance(row, str): schemes.append(json.loads(row))
         return schemes
     except Exception as e:
         st.error(f"🚨 读取方案失败，请检查云端数据库连接！ {e}")
         return []
 
-# 💡 页面的初始化状态
 if 'schemes' not in st.session_state: 
     st.session_state.schemes = load_schemes() 
 if 'editing_id' not in st.session_state: 
     st.session_state.editing_id = None
 
-# URL 记忆
+# 💡 URL 记忆 (报警线默认改为 0)
 if "chart_height" not in st.session_state: st.session_state.chart_height = int(st.query_params.get("chart_height", 350))
 if "dtick_val" not in st.session_state: st.session_state.dtick_val = int(st.query_params.get("dtick_val", 10000))
-if "pos_alert" not in st.session_state: st.session_state.pos_alert = float(st.query_params.get("pos_alert", 10000.0))
-if "neg_alert" not in st.session_state: st.session_state.neg_alert = float(st.query_params.get("neg_alert", -5000.0))
+if "pos_alert" not in st.session_state: st.session_state.pos_alert = float(st.query_params.get("pos_alert", 0.0))
+if "neg_alert" not in st.session_state: st.session_state.neg_alert = float(st.query_params.get("neg_alert", 0.0))
 
 def sync_alerts_to_url():
     st.query_params["pos_alert"] = str(st.session_state.pos_alert)
@@ -406,6 +401,7 @@ if not df_all.empty:
 
 # 💡 报警线设置与图表调节面板
 with st.expander("报警线设置与图表调节", expanded=False):
+    st.caption("💡 填 0 或留空代表不设提醒。将根据最新一期累计盈亏是否突破该值来报警。")
     c_alert1, c_alert2 = st.columns(2)
     with c_alert1: st.number_input("正峰值报警线 (元) - 止盈", step=1000.0, key="pos_alert", on_change=sync_alerts_to_url)
     with c_alert2: st.number_input("负峰值报警线 (元) - 止损", step=-1000.0, key="neg_alert", on_change=sync_alerts_to_url)
@@ -528,22 +524,29 @@ else:
     merged_pl['累计盈亏'] = merged_pl['本期盈亏'].cumsum()
     total_combined_pl = merged_pl['本期盈亏'].sum()
     
+    # 💡 提取历史最高/最低点用于图表标记
     peak_value = merged_pl['累计盈亏'].max()
     peak_issue = merged_pl.loc[merged_pl['累计盈亏'].idxmax(), '期号']
     low_peak_value = merged_pl['累计盈亏'].min()
     low_peak_issue = merged_pl.loc[merged_pl['累计盈亏'].idxmin(), '期号']
     
-    alert_pos_triggered = peak_value >= st.session_state.pos_alert
-    alert_neg_triggered = low_peak_value <= st.session_state.neg_alert
+    # 💡 提取最新一期的累计盈亏，用于报警判断
+    latest_pl = merged_pl.iloc[-1]['累计盈亏']
     
-    if alert_pos_triggered or alert_neg_triggered:
+    alert_pos_val = st.session_state.pos_alert
+    alert_neg_val = st.session_state.neg_alert
+    
+    trigger_pos = (alert_pos_val != 0) and (latest_pl >= alert_pos_val)
+    trigger_neg = (alert_neg_val != 0) and (latest_pl <= alert_neg_val)
+    
+    if trigger_pos or trigger_neg:
         play_beep_sound()
-        if alert_pos_triggered and alert_neg_triggered:
-            st.error(f"极度波动报警！触发正峰值线 (最高: ¥{peak_value:,.2f}) 且 触发负峰值线 (最低: ¥{low_peak_value:,.2f})。")
-        elif alert_pos_triggered:
-            st.success(f"止盈报警！突破正峰值报警线！最高盈亏达到 ¥{peak_value:,.2f} (设定线: ¥{st.session_state.pos_alert:,.2f})")
-        elif alert_neg_triggered:
-            st.warning(f"止损报警！跌破负峰值报警线！最低盈亏达到 ¥{low_peak_value:,.2f} (设定线: ¥{st.session_state.neg_alert:,.2f})")
+        if trigger_pos and trigger_neg:
+            st.error(f"🚨 **极度波动报警！** 最新累计盈亏 ¥{latest_pl:,.2f} 同时突破了止盈(¥{alert_pos_val:,.2f})和止损(¥{alert_neg_val:,.2f})线。")
+        elif trigger_pos:
+            st.success(f"🎉 **止盈报警！** 最新累计盈亏 ¥{latest_pl:,.2f} 突破正峰值报警线 (设定线: ¥{alert_pos_val:,.2f})")
+        elif trigger_neg:
+            st.warning(f"⚠️ **止损报警！** 最新累计盈亏 ¥{latest_pl:,.2f} 跌破负峰值报警线 (设定线: ¥{alert_neg_val:,.2f})")
 
     active_groups = set([s.get('group_name','').strip() for s in active_schemes if s.get('group_name','').strip()])
     combined_names = list(active_groups)[0] if active_groups and len(active_groups) == 1 else " + ".join([s['name'] for s in active_schemes])
