@@ -202,19 +202,51 @@ def parse_draw(row):
     if len(nums) >= 7: return sorted(nums[:6]), nums[-1]
     return [], 0
 
-# ================= 2. 侧边栏控制台 =================
+# ================= 2. 侧边栏控制台 (新版日期逻辑) =================
 st.sidebar.markdown("### 全局控制")
-btn_col1, btn_col2, btn_col3 = st.sidebar.columns(3)
+st.sidebar.markdown("**📅 快捷时间**")
+
+import calendar
 today = datetime.today().date()
-month_start = today - timedelta(days=30)
 
-if btn_col1.button("今天", use_container_width=True): st.session_state.date_range = (today, today)
-if btn_col2.button("近30天", use_container_width=True): st.session_state.date_range = (month_start, today)
-if btn_col3.button("本年", use_container_width=True): st.session_state.date_range = (datetime(today.year,1,1).date(), today)
+this_week_start = today - timedelta(days=today.weekday())
+last_week_start = this_week_start - timedelta(days=7)
+last_week_end = this_week_start - timedelta(days=1)
+this_month_start = today.replace(day=1)
+last_month_end = this_month_start - timedelta(days=1)
+last_month_start = last_month_end.replace(day=1)
+this_year_start = today.replace(month=1, day=1)
 
-if 'date_range' not in st.session_state: st.session_state.date_range = (month_start, today)
-start_date = st.sidebar.date_input("开始日期", value=st.session_state.date_range[0])
-end_date = st.sidebar.date_input("结束日期", value=st.session_state.date_range[1])
+if 'date_start' not in st.session_state:
+    st.session_state.date_start = this_month_start
+if 'date_end' not in st.session_state:
+    st.session_state.date_end = today
+
+def update_date_range(start, end):
+    st.session_state.date_start = start
+    st.session_state.date_end = end
+
+# 第一排按钮
+c1, c2, c3 = st.sidebar.columns(3)
+if c1.button("今天", use_container_width=True): update_date_range(today, today)
+if c2.button("本周", use_container_width=True): update_date_range(this_week_start, today)
+if c3.button("上周", use_container_width=True): update_date_range(last_week_start, last_week_end)
+
+# 第二排按钮
+c4, c5, c6 = st.sidebar.columns(3)
+if c4.button("本月", use_container_width=True): update_date_range(this_month_start, today)
+if c5.button("上月", use_container_width=True): update_date_range(last_month_start, last_month_end)
+if c6.button("今年", use_container_width=True): update_date_range(this_year_start, today)
+
+# 日期选择器（必须带上 key，才能响应按钮的改变）
+start_date = st.sidebar.date_input("开始日期", value=st.session_state.date_start, key="start_date_widget")
+end_date = st.sidebar.date_input("结束日期", value=st.session_state.date_end, key="end_date_widget")
+
+# 让手动选择日期时，也能同步更新底层状态，避免冲突
+if start_date != st.session_state.date_start or end_date != st.session_state.date_end:
+    st.session_state.date_start = start_date
+    st.session_state.date_end = end_date
+    st.rerun()
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("### 方案管理")
@@ -257,7 +289,6 @@ with st.sidebar.expander(form_title, expanded=is_editing):
         sub_cat = st.selectbox("玩法细分", ["3中3", "3中2", "2中2", "特串"], index=["3中3", "3中2", "2中2", "特串"].index(def_sub) if def_sub in ["3中3", "3中2", "2中2", "特串"] else 0)
         numbers_str = st.text_input("号码池", value=def_nums)
         
-        # 💡 修复：连码复式下的特串，取消了第二个特码池
         if sub_cat == "特串":
             numbers2_str = "" 
         else:
@@ -433,7 +464,6 @@ def calculate_scheme_cached(df, scheme, time_filter=""):
         n = len(scheme['numbers'])
         if sub in ["3中3", "3中2"]: bet_count = len(list(itertools.combinations(range(n), 3)))
         elif sub == "2中2": bet_count = len(list(itertools.combinations(range(n), 2)))
-        # 💡 修复：连码复式 - 特串，按 C(n,2) 算注数
         else: bet_count = len(list(itertools.combinations(range(n), 2)))
     else: 
         L, R = len(scheme['numbers']), len(scheme['numbers2'])
@@ -463,7 +493,6 @@ def calculate_scheme_cached(df, scheme, time_filter=""):
             elif sub == "2中2":
                 for grp in itertools.combinations(nums, 2):
                     if all(n in draw_normals for n in grp): hn += 1
-            # 💡 修复：连码复式 - 特串的判定逻辑
             elif sub == "特串":
                 for grp in itertools.combinations(nums, 2):
                     n1, n2 = grp
@@ -515,7 +544,7 @@ else:
         
     df_filtered["正码"], df_filtered["特码"] = zip(*df_filtered.apply(parse_draw, axis=1))
     
-    # 进度条初始化
+    # 💡 进度条初始化
     total_schemes = len(active_schemes)
     total_days = len(df_filtered)
     progress_text = f"正在计算历史盈亏... (共 {total_days} 期数据)"
@@ -533,11 +562,11 @@ else:
             res['方案名称'] = scheme['name']
             all_res_dfs.append(res)
             
-        # 更新进度条
+        # 💡 更新进度条
         pct = int((i + 1) / total_schemes * 100)
         my_bar.progress(
             (i + 1) / total_schemes, 
-            text=f"正在计算方案: {scheme['name']} ({pct}%) | 处理天数: {total_days} 天"
+            text=f"正在计算方案: {scheme['name']} ({pct}%) | 已处理 {total_days} 期"
         )
         
     my_bar.empty() # 算完后清除进度条
