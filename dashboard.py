@@ -202,7 +202,7 @@ def parse_draw(row):
     if len(nums) >= 7: return sorted(nums[:6]), nums[-1]
     return [], 0
 
-# ================= 2. 侧边栏控制台 (新版日期逻辑) =================
+# ================= 2. 侧边栏控制台 =================
 st.sidebar.markdown("### 全局控制")
 st.sidebar.markdown("**📅 快捷时间**")
 
@@ -217,36 +217,32 @@ last_month_end = this_month_start - timedelta(days=1)
 last_month_start = last_month_end.replace(day=1)
 this_year_start = today.replace(month=1, day=1)
 
-if 'date_start' not in st.session_state:
-    st.session_state.date_start = this_month_start
-if 'date_end' not in st.session_state:
-    st.session_state.date_end = today
+# 💡 初始化 session_state 中的日期控件值（只执行一次）
+if 'start_date_widget' not in st.session_state:
+    st.session_state.start_date_widget = this_month_start
+if 'end_date_widget' not in st.session_state:
+    st.session_state.end_date_widget = today
 
-def update_date_range(start, end):
-    st.session_state.date_start = start
-    st.session_state.date_end = end
+# 💡 点击按钮时，直接修改控件的 key，强制 UI 刷新
+def set_dates(s_date, e_date):
+    st.session_state.start_date_widget = s_date
+    st.session_state.end_date_widget = e_date
 
 # 第一排按钮
 c1, c2, c3 = st.sidebar.columns(3)
-if c1.button("今天", use_container_width=True): update_date_range(today, today)
-if c2.button("本周", use_container_width=True): update_date_range(this_week_start, today)
-if c3.button("上周", use_container_width=True): update_date_range(last_week_start, last_week_end)
+if c1.button("今天", use_container_width=True): set_dates(today, today)
+if c2.button("本周", use_container_width=True): set_dates(this_week_start, today)
+if c3.button("上周", use_container_width=True): set_dates(last_week_start, last_week_end)
 
 # 第二排按钮
 c4, c5, c6 = st.sidebar.columns(3)
-if c4.button("本月", use_container_width=True): update_date_range(this_month_start, today)
-if c5.button("上月", use_container_width=True): update_date_range(last_month_start, last_month_end)
-if c6.button("今年", use_container_width=True): update_date_range(this_year_start, today)
+if c4.button("本月", use_container_width=True): set_dates(this_month_start, today)
+if c5.button("上月", use_container_width=True): set_dates(last_month_start, last_month_end)
+if c6.button("今年", use_container_width=True): set_dates(this_year_start, today)
 
-# 日期选择器（必须带上 key，才能响应按钮的改变）
-start_date = st.sidebar.date_input("开始日期", value=st.session_state.date_start, key="start_date_widget")
-end_date = st.sidebar.date_input("结束日期", value=st.session_state.date_end, key="end_date_widget")
-
-# 让手动选择日期时，也能同步更新底层状态，避免冲突
-if start_date != st.session_state.date_start or end_date != st.session_state.date_end:
-    st.session_state.date_start = start_date
-    st.session_state.date_end = end_date
-    st.rerun()
+# 💡 控件只绑定 key，不写 value，这样 Streamlit 会自动从 session_state 取值并展示
+start_date = st.sidebar.date_input("开始日期", key="start_date_widget")
+end_date = st.sidebar.date_input("结束日期", key="end_date_widget")
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("### 方案管理")
