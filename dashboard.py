@@ -419,8 +419,9 @@ with st.expander("报警线设置与图表调节", expanded=False):
             st.query_params["dtick_val"] = str(new_dtick)
             st.rerun()
 
-# 💡 移除 cache_data，直接计算
-def calculate_scheme(df, scheme, time_filter=""):
+# 💡 核心优化：加回 @st.cache_data，直接传 DataFrame（Streamlit 原生支持）
+@st.cache_data(show_spinner=False)
+def calculate_scheme_cached(df, scheme, time_filter=""):
     cat, sub = scheme['category'], scheme['sub_type']
     if cat == "特码类": bet_count = len(scheme['numbers'])
     elif cat == "连码复式":
@@ -506,17 +507,18 @@ else:
         
     df_filtered["正码"], df_filtered["特码"] = zip(*df_filtered.apply(parse_draw, axis=1))
     
-    # 💡 进度条初始化
+    # 💡 进度条初始化（包含总天数提示）
     total_schemes = len(active_schemes)
-    progress_text = "正在计算历史盈亏..."
+    total_days = len(df_filtered)
+    progress_text = f"正在计算历史盈亏... (共 {total_days} 期数据)"
     my_bar = st.progress(0, text=progress_text)
     
     scheme_results = {}
     all_res_dfs = []
     
     for i, scheme in enumerate(active_schemes):
-        # 直接计算，不传 json 字符串
-        res = calculate_scheme(df_filtered, scheme, "")
+        # 使用带缓存的函数，直接传 DataFrame
+        res = calculate_scheme_cached(df_filtered, scheme, "")
         
         scheme_results[scheme['id']] = res
         
@@ -524,9 +526,12 @@ else:
             res['方案名称'] = scheme['name']
             all_res_dfs.append(res)
             
-        # 💡 更新进度条
+        # 💡 更新进度条，显示当前方案名和完成天数
         pct = int((i + 1) / total_schemes * 100)
-        my_bar.progress((i + 1) / total_schemes, text=f"正在计算: {scheme['name']} ({pct}%)")
+        my_bar.progress(
+            (i + 1) / total_schemes, 
+            text=f"正在计算方案: {scheme['name']} ({pct}%) | 处理天数: {total_days} 天"
+        )
         
     my_bar.empty() # 算完后清除进度条
     
