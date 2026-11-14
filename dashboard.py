@@ -96,29 +96,24 @@ def force_sync_until_today(lottery_name):
     """智能断档补齐：自动检测本地库最新日期，补齐到今天"""
     config = LOTTERY_MAP.get(lottery_name)
     if not config: return "未知彩种"
-
+    
     end_date = datetime.today().date()
-
+    
     # 1. 查库里最新的一期是哪天
     try:
         df_old = pd.read_sql(f"SELECT draw_time FROM lottery_data WHERE lottery_name = '{lottery_name}' ORDER BY draw_time DESC LIMIT 1", engine)
         if df_old.empty:
-            start_date = end_date - timedelta(days=30)  # 空库默认抓30天
+            start_date = end_date - timedelta(days=30) # 空库默认抓30天
         else:
             max_date = pd.to_datetime(df_old.iloc[0]['draw_time']).date()
-            # ✅ 只有 香港六合彩 / 快乐8六合彩 才跳过"日期短路"，并回扫 max_date - 1 天
-            #    其他彩种（含高频彩）走原逻辑，行为 100% 不变
-            if lottery_name in ("香港六合彩", "快乐8六合彩"):
-                start_date = max_date - timedelta(days=1)
-            else:
-                if max_date >= end_date:
-                    return "✅ 已是最新 (本地已有今天的开奖数据)"
-                start_date = max_date
+            if max_date >= end_date:
+                return "✅ 已是最新 (本地已有今天的开奖数据)"
+            start_date = max_date
     except Exception as e:
         return f"❌ 读取数据库失败: {e}"
 
     delta_days = (end_date - start_date).days + 1
-
+    
     # 💡 安全阀：为了防止断档半年后点击导致请求爆炸被封IP，最多往回抓60天
     if delta_days > 60:
         start_date = end_date - timedelta(days=60)
@@ -126,15 +121,15 @@ def force_sync_until_today(lottery_name):
         limit_msg = " (因断档过久，为防封禁仅补齐最近60天)"
     else:
         limit_msg = ""
-
+    
     all_new_data = []
     error_logs = []
     headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://166w2.com/"}
-
+    
     for day_offset in range(delta_days):
         target_date = start_date + timedelta(days=day_offset)
         y, m, d = target_date.strftime("%Y"), target_date.month, target_date.day
-
+        
         if config["type"] == "dpc":
             url = f"https://data.kai8.us/api/lottery/history_dpc/KAI166/{config['code']}/{y}/{m}/{d}"
             try:
@@ -148,7 +143,6 @@ def force_sync_until_today(lottery_name):
                 error_logs.append(f"{target_date} 异常:{str(e)[:20]}")
             time.sleep(0.02)
         else:
-            # 高频彩（宾果/加拿大）分支：原样保留，一行不改
             for h in range(24):
                 url = f"https://data.kai8.us/api/lottery/history_gpc/KAI166/{config['code']}/{y}-{m:02d}-{d:02d}/{h}/30"
                 try:
@@ -171,16 +165,11 @@ def force_sync_until_today(lottery_name):
     try:
         existing = pd.read_sql(f"SELECT issue FROM lottery_data WHERE lottery_name = '{lottery_name}'", engine)['issue'].astype(str).str.strip().tolist()
         df_new = df_new[~df_new['issue'].isin(existing)]
-
-        # 接口本次返回的最新期号（用于给"已是最新"补上真实期号，避免误判）
-        api_latest_issue = pd.DataFrame(all_new_data)['issue'].astype(str).str.strip().max()
-
         if not df_new.empty:
             df_new.to_sql('lottery_data', engine, if_exists='append', index=False)
             return f"✅ 补齐完成！扫描了 {start_date} 至 {end_date}，新增 {len(df_new)} 条数据。最新一期: {df_new.iloc[-1]['issue']}{limit_msg}"
         else:
-            # ✅ 区分：接口有数据但全已存在 vs 接口本次没返回
-            return f"✅ 已是最新（接口最新期 {api_latest_issue} 已入库，扫描 {start_date} 至 {end_date}）{limit_msg}"
+            return f"已是最新 (扫描范围内数据均已存在，官网可能尚未开奖){limit_msg}"
     except Exception as e:
         return f"❌ 写入数据库失败: {e}"
 
@@ -479,14 +468,13 @@ with c_lottery:
     
     is_high_freq = ("宾果" in selected_lottery or "加拿大" in selected_lottery)
     
-    # 💡 临时注释掉自动同步进行排查，如果页面出来了说明是它导致的
     if is_high_freq:
         st_autorefresh(interval=60000, limit=None, key="high_freq_refresh")
-        # auto_sync_data(selected_lottery) 
+        auto_sync_data(selected_lottery)
     else:
         cache_key = f"synced_{selected_lottery}"
         if cache_key not in st.session_state:
-            # auto_sync_data(selected_lottery)
+            auto_sync_data(selected_lottery)
             st.session_state[cache_key] = True
 
     try:
@@ -502,10 +490,12 @@ with c_lottery:
 with c_action:
     st.markdown("<div style='margin-top: 10px;'></div>", unsafe_allow_html=True)
     if st.button("立即手动补齐断档数据", use_container_width=True, type="primary"):
+        # 💡 调用智能断档补齐函数
         msg = force_sync_until_today(selected_lottery)
         st.session_state.sync_msg = msg
         st.rerun()
 
+# 💡 显示抓取结果提示
 if st.session_state.sync_msg:
     if "✅" in st.session_state.sync_msg:
         st.success(st.session_state.sync_msg)
@@ -530,6 +520,7 @@ if not df_all.empty:
         </div>
         """, unsafe_allow_html=True)
 
+# 💡 报警线设置与图表调节面板
 with st.expander("报警线设置与图表调节", expanded=False):
     st.caption("💡 填 0 或留空代表不设提醒。将根据最新一期累计盈亏是否突破该值来报警。")
     c_alert1, c_alert2 = st.columns(2)
@@ -639,6 +630,7 @@ else:
         
     df_filtered["正码"], df_filtered["特码"] = zip(*df_filtered.apply(parse_draw, axis=1))
     
+    # 进度条初始化
     total_schemes = len(active_schemes)
     total_days = len(df_filtered)
     progress_text = f"正在计算历史盈亏... (共 {total_days} 期数据)"
@@ -649,14 +641,21 @@ else:
     
     for i, scheme in enumerate(active_schemes):
         res = calculate_scheme_cached(df_filtered, scheme, "")
+        
         scheme_results[scheme['id']] = res
+        
         if not res.empty:
             res['方案名称'] = scheme['name']
             all_res_dfs.append(res)
+            
+        # 更新进度条
         pct = int((i + 1) / total_schemes * 100)
-        my_bar.progress((i + 1) / total_schemes, text=f"正在计算方案: {scheme['name']} ({pct}%) | 已处理 {total_days} 期")
+        my_bar.progress(
+            (i + 1) / total_schemes, 
+            text=f"正在计算方案: {scheme['name']} ({pct}%) | 已处理 {total_days} 期"
+        )
         
-    my_bar.empty()
+    my_bar.empty() # 算完后清除进度条
     
     if not all_res_dfs:
         st.warning("当前过滤条件下无数据。")
