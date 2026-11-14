@@ -92,7 +92,6 @@ LOTTERY_MAP = {
     "加拿大六合彩": {"code": "JNDLHC", "type": "gpc"}
 }
 
-# 💡 低频彩专用（手动触发）
 def force_sync_low_freq(lottery_name):
     config = LOTTERY_MAP.get(lottery_name)
     if not config: return "未知彩种"
@@ -106,7 +105,6 @@ def force_sync_low_freq(lottery_name):
     all_new_data = []
     headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://166w2.com/"}
     
-    # 查最新接口
     url = f"https://data.kai8.us/api/lottery/issue/KAI166/{config['code']}"
     try:
         res = requests.get(url, headers=headers, timeout=5)
@@ -121,7 +119,6 @@ def force_sync_low_freq(lottery_name):
                 })
     except Exception: pass
         
-    # 兜底查3天
     if not all_new_data or int(all_new_data[0]["issue"]) <= db_max_issue:
         end_date = datetime.today().date()
         start_date = end_date - timedelta(days=3)
@@ -159,7 +156,6 @@ def force_sync_low_freq(lottery_name):
         if not df_new.empty:
             df_to_save = df_new.drop(columns=['issue_int'])
             df_to_save.to_sql('lottery_data', engine, if_exists='append', index=False)
-            # 💡 清理数据库读取缓存，让下次读库能拿到最新数据
             load_data_from_db.clear()
             return f"✅ 补齐完成，新增 {len(df_new)} 条！最新一期: {df_new['issue_int'].max()}"
         else:
@@ -167,8 +163,6 @@ def force_sync_low_freq(lottery_name):
     except Exception as e:
         return f"❌ 写入数据库失败: {e}"
 
-
-# 💡 高频彩专用（自动触发，防抖防卡）
 def auto_sync_high_freq(lottery_name):
     config = LOTTERY_MAP.get(lottery_name)
     if not config: return False
@@ -214,7 +208,7 @@ def auto_sync_high_freq(lottery_name):
     except Exception: pass
     return False
 
-# ================= 💾 数据库缓存层 (修复卡顿核心) =================
+# ================= 💾 数据库缓存层 =================
 @st.cache_data(ttl=10, show_spinner=False)
 def load_data_from_db(lottery_name):
     query = f"SELECT issue as 期号, draw_time as 开奖日期, draw_code as 开奖号码 FROM lottery_data WHERE lottery_name = '{lottery_name}'"
@@ -444,13 +438,19 @@ if st.session_state.schemes:
             if g_name == "（未分组）":
                 for s in s_list: render_scheme_row(s)
             else:
-                group_active = all(s['active'] for s in s_list)
-                new_group_active = st.checkbox(f"组合: {g_name}", value=group_active, key=f"grp_{g_name}")
-                if new_group_active != group_active:
-                    for s in s_list: 
-                        s['active'] = new_group_active
+                st.markdown(f"**组合: {g_name}**")
+                col_a, col_b = st.columns(2)
+                if col_a.button("✅ 全选", key=f"sel_all_{g_name}", use_container_width=True):
+                    for s in s_list:
+                        s['active'] = True
                         save_scheme_to_db(s)
                     st.rerun()
+                if col_b.button("❌ 取消", key=f"desel_all_{g_name}", use_container_width=True):
+                    for s in s_list:
+                        s['active'] = False
+                        save_scheme_to_db(s)
+                    st.rerun()
+                    
                 with st.expander(f"查看 {g_name} 内的方案", expanded=False):
                     for s in s_list: render_scheme_row(s)
 
@@ -464,17 +464,15 @@ with c_lottery:
     
     is_high_freq = ("宾果" in selected_lottery or "加拿大" in selected_lottery)
     
-    # 高频彩：保留1分钟自动刷新，且防抖
     if is_high_freq:
         st_autorefresh(interval=60000, limit=None, key="high_freq_refresh")
         sync_time_key = f"last_sync_time_{selected_lottery}"
         current_time = time.time()
         last_sync = st.session_state.get(sync_time_key, 0)
-        if current_time - last_sync > 50: # 50秒内只同步一次
+        if current_time - last_sync > 50:
             auto_sync_high_freq(selected_lottery)
             st.session_state[sync_time_key] = current_time
             
-    # 读取数据（走缓存）
     df_all = load_data_from_db(selected_lottery)
 
 with c_action:
@@ -536,7 +534,6 @@ with st.expander("报警线设置与图表调节", expanded=False):
             st.query_params["dtick_val"] = str(new_dtick)
             st.rerun()
 
-# 💡 计算逻辑走缓存，防止重算（修复卡顿的终极武器）
 @st.cache_data(show_spinner=False)
 def calculate_scheme_cached(df_filtered, scheme, time_filter=""):
     cat, sub = scheme['category'], scheme['sub_type']
@@ -631,133 +628,133 @@ else:
     my_bar = st.progress(0, text=progress_text)
     
     scheme_results = {}
-    all_res_dfs = []
     
     for i, scheme in enumerate(active_schemes):
         res = calculate_scheme_cached(df_filtered, scheme, "")
         scheme_results[scheme['id']] = res
-        if not res.empty:
-            res['方案名称'] = scheme['name']
-            all_res_dfs.append(res)
-            
+        
         pct = int((i + 1) / total_schemes * 100)
         my_bar.progress((i + 1) / total_schemes, text=f"正在计算方案: {scheme['name']} ({pct}%) | 已处理 {total_days} 期")
         
     my_bar.empty()
-    
-    if not all_res_dfs:
-        st.warning("当前过滤条件下无数据。")
-        st.stop()
+
+    # ================= 大方案独立出图 =================
+    # 按 group_name 分组
+    grouped_active = {}
+    for s in active_schemes:
+        g_name = s.get('group_name', '').strip() or "未分组"
+        grouped_active.setdefault(g_name, []).append(s)
+
+    for g_name, g_schemes in grouped_active.items():
+        group_res_dfs = []
+        for s in g_schemes:
+            res = scheme_results.get(s['id'])
+            if res is not None and not res.empty:
+                group_res_dfs.append(res)
+                
+        if not group_res_dfs:
+            continue
+            
+        g_combined = pd.concat(group_res_dfs)
+        g_merged = g_combined.groupby(['期号', '开奖日期']).agg({'命中注数': 'sum', '本期盈亏': 'sum'}).reset_index()
+        g_merged['累计盈亏'] = g_merged['本期盈亏'].cumsum()
+        g_total_pl = g_merged['本期盈亏'].sum()
+
+        g_peak_val = g_merged['累计盈亏'].max()
+        g_peak_issue = g_merged.loc[g_merged['累计盈亏'].idxmax(), '期号']
+        g_low_peak_val = g_merged['累计盈亏'].min()
+        g_low_peak_issue = g_merged.loc[g_merged['累计盈亏'].idxmin(), '期号']
         
-    combined_df = pd.concat(all_res_dfs)
-    merged_pl = combined_df.groupby(['期号', '开奖日期']).agg({'命中注数': 'sum', '本期盈亏': 'sum'}).reset_index()
-    merged_pl['累计盈亏'] = merged_pl['本期盈亏'].cumsum()
-    total_combined_pl = merged_pl['本期盈亏'].sum()
+        g_latest_pl = g_merged.iloc[-1]['累计盈亏']
 
-    peak_value = merged_pl['累计盈亏'].max()
-    peak_issue = merged_pl.loc[merged_pl['累计盈亏'].idxmax(), '期号']
-    low_peak_value = merged_pl['累计盈亏'].min()
-    low_peak_issue = merged_pl.loc[merged_pl['累计盈亏'].idxmin(), '期号']
-    
-    latest_pl = merged_pl.iloc[-1]['累计盈亏']
-    
-    alert_pos_val = st.session_state.pos_alert
-    alert_neg_val = st.session_state.neg_alert
-    
-    trigger_pos = (alert_pos_val != 0) and (latest_pl >= alert_pos_val)
-    trigger_neg = (alert_neg_val != 0) and (latest_pl <= alert_neg_val)
-    
-    if trigger_pos or trigger_neg:
-        play_beep_sound()
-        if trigger_pos and trigger_neg:
-            st.error(f"🚨 **极度波动报警！** 最新累计盈亏 ¥{latest_pl:,.2f} 同时突破了止盈(¥{alert_pos_val:,.2f})和止损(¥{alert_neg_val:,.2f})线。")
-        elif trigger_pos:
-            st.success(f"🎉 **止盈报警！** 最新累计盈亏 ¥{latest_pl:,.2f} 突破正峰值报警线 (设定线: ¥{alert_pos_val:,.2f})")
-        elif trigger_neg:
-            st.warning(f"⚠️ **止损报警！** 最新累计盈亏 ¥{latest_pl:,.2f} 跌破负峰值报警线 (设定线: ¥{alert_neg_val:,.2f})")
+        # 报警逻辑
+        alert_pos_val = st.session_state.pos_alert
+        alert_neg_val = st.session_state.neg_alert
+        trigger_pos = (alert_pos_val != 0) and (g_latest_pl >= alert_pos_val)
+        trigger_neg = (alert_neg_val != 0) and (g_latest_pl <= alert_neg_val)
+        
+        if trigger_pos or trigger_neg:
+            play_beep_sound()
+            if trigger_pos and trigger_neg:
+                st.error(f"🚨 **极度波动报警！** [{g_name}] 最新累计盈亏 ¥{g_latest_pl:,.2f} 同时突破了止盈(¥{alert_pos_val:,.2f})和止损(¥{alert_neg_val:,.2f})线。")
+            elif trigger_pos:
+                st.success(f"🎉 **止盈报警！** [{g_name}] 最新累计盈亏 ¥{g_latest_pl:,.2f} 突破正峰值报警线 (设定线: ¥{alert_pos_val:,.2f})")
+            elif trigger_neg:
+                st.warning(f"⚠️ **止损报警！** [{g_name}] 最新累计盈亏 ¥{g_latest_pl:,.2f} 跌破负峰值报警线 (设定线: ¥{alert_neg_val:,.2f})")
 
-    active_groups = set([s.get('group_name','').strip() for s in active_schemes if s.get('group_name','').strip()])
-    if active_groups and len(active_groups) == 1:
-        combined_names = list(active_groups)[0]
-    else:
-        names_list = [s['name'] for s in active_schemes]
-        if len(names_list) > 2:
-            combined_names = f"{names_list[0]} 等{len(names_list)}个方案"
-        else:
-            combined_names = " + ".join(names_list)
-    
-    st.markdown(f"### 合并总盈亏 ({combined_names})")
-    
-    c_mid, c_right = st.columns([1.5, 3])
-    with c_mid:
-        st.markdown(f"""
-        <div class="custom-card" style="border-left: 4px solid {'#22C55E' if total_combined_pl >= 0 else '#EF4444'}; padding: 15px; background: #121212; border-radius: 6px;">
-            <div class="text-gray" style="color: #A3A3A3; font-size: 13px;">合计盈亏 (元)</div>
-            <div class="huge-number" style="font-size: 36px; font-weight: 800; color: {'#22C55E' if total_combined_pl >= 0 else '#EF4444'};">¥ {total_combined_pl:,.2f}</div>
-            <div class="peak-text-pos" style="color: #22C55E; font-size: 13px; margin-top: 5px;">最高: ¥ {peak_value:,.2f} ({peak_issue}期)</div>
-            <div class="peak-text-neg" style="color: #EF4444; font-size: 13px; margin-top: 3px;">最低: ¥ {low_peak_value:,.2f} ({low_peak_issue}期)</div>
-        </div>
-        """, unsafe_allow_html=True)
-    
-    with c_right:
-        fig_combined = px.line(merged_pl, x="期号", y="累计盈亏", markers=True, template="plotly_dark")
-        fig_combined.update_layout(
-            plot_bgcolor='rgba(0,0,0,0)', paper_bgcolor='rgba(0,0,0,0)', 
-            height=st.session_state.chart_height, margin=dict(l=10, r=10, t=25, b=5), 
-            title=dict(text="合并总盈亏走势", font=dict(size=12, color="#A3A3A3")), 
-            yaxis=dict(dtick=st.session_state.dtick_val)
-        )
-        fig_combined.add_scatter(x=[peak_issue], y=[peak_value], mode='markers+text', text=[f"最高: {peak_value:,.0f}"], textposition="top center", marker=dict(size=8, color='#22C55E', symbol='star'), textfont=dict(color='#22C55E', size=10))
-        fig_combined.add_scatter(x=[low_peak_issue], y=[low_peak_value], mode='markers+text', text=[f"最低: {low_peak_value:,.0f}"], textposition="bottom center", marker=dict(size=8, color='#EF4444', symbol='star'), textfont=dict(color='#EF4444', size=10))
-        fig_combined.update_traces(selector=dict(type='scatter', mode='lines+markers'), line_color='#38BDF8', line_width=2, marker=dict(size=5, color='#38BDF8'))
-        st.plotly_chart(fig_combined, use_container_width=True, key="chart_combined")
+        st.markdown(f"### 大方案合并盈亏 ({g_name})")
+        
+        c_mid, c_right = st.columns([1.5, 3])
+        with c_mid:
+            st.markdown(f"""
+            <div class="custom-card" style="border-left: 4px solid {'#22C55E' if g_total_pl >= 0 else '#EF4444'}; padding: 15px; background: #121212; border-radius: 6px;">
+                <div class="text-gray" style="color: #A3A3A3; font-size: 13px;">合计盈亏 (元)</div>
+                <div class="huge-number" style="font-size: 36px; font-weight: 800; color: {'#22C55E' if g_total_pl >= 0 else '#EF4444'};">¥ {g_total_pl:,.2f}</div>
+                <div class="peak-text-pos" style="color: #22C55E; font-size: 13px; margin-top: 5px;">最高: ¥ {g_peak_val:,.2f} ({g_peak_issue}期)</div>
+                <div class="peak-text-neg" style="color: #EF4444; font-size: 13px; margin-top: 3px;">最低: ¥ {g_low_peak_val:,.2f} ({g_low_peak_issue}期)</div>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        with c_right:
+            fig_g = px.line(g_merged, x="期号", y="累计盈亏", markers=True, template="plotly_dark")
+            fig_g.update_layout(
+                plot_bgcolor='rgba(0,0,0,0)', paper_bgcolor='rgba(0,0,0,0)', 
+                height=st.session_state.chart_height, margin=dict(l=10, r=10, t=25, b=5), 
+                title=dict(text=f"{g_name} 合并总盈亏走势", font=dict(size=12, color="#A3A3A3")), 
+                yaxis=dict(dtick=st.session_state.dtick_val)
+            )
+            fig_g.add_scatter(x=[g_peak_issue], y=[g_peak_val], mode='markers+text', text=[f"最高: {g_peak_val:,.0f}"], textposition="top center", marker=dict(size=8, color='#22C55E', symbol='star'), textfont=dict(color='#22C55E', size=10))
+            fig_g.add_scatter(x=[g_low_peak_issue], y=[g_low_peak_val], mode='markers+text', text=[f"最低: {g_low_peak_val:,.0f}"], textposition="bottom center", marker=dict(size=8, color='#EF4444', symbol='star'), textfont=dict(color='#EF4444', size=10))
+            fig_g.update_traces(selector=dict(type='scatter', mode='lines+markers'), line_color='#38BDF8', line_width=2, marker=dict(size=5, color='#38BDF8'))
+            st.plotly_chart(fig_g, use_container_width=True, key=f"chart_group_{g_name}")
 
-    with st.expander("查看合并每日明细记录", expanded=False):
-        st.dataframe(merged_pl, use_container_width=True, hide_index=True, height=200)
-    
+        with st.expander(f"查看 {g_name} 每日明细记录", expanded=False):
+            st.dataframe(g_merged, use_container_width=True, hide_index=True, height=200)
+            
+        st.markdown("<br>", unsafe_allow_html=True)
+
     st.markdown("---")
-    st.markdown("### 各方案独立明细")
+    st.markdown("### 各方案独立明细 (下拉选择查看，防止卡顿)")
     
-    tabs = st.tabs([s['name'] for s in active_schemes])
-    for idx, scheme in enumerate(active_schemes):
-        with tabs[idx]:
-            res_df = scheme_results.get(scheme['id'])
-            if res_df is None or res_df.empty: continue
-            
-            total_pl = res_df['本期盈亏'].sum()
-            win_periods = len(res_df[res_df['命中注数'] > 0])
-            win_rate = (win_periods / len(res_df) * 100) if len(res_df) > 0 else 0
-            
-            s_peak_value = res_df['累计盈亏'].max()
-            s_peak_issue = res_df.loc[res_df['累计盈亏'].idxmax(), '期号']
-            s_low_peak_value = res_df['累计盈亏'].min()
-            s_low_peak_issue = res_df.loc[res_df['累计盈亏'].idxmin(), '期号']
-            
-            col_res_left, col_res_right = st.columns([1.5, 3])
-            with col_res_left:
-                st.markdown(f"""
-                <div class="custom-card" style="border-left: 4px solid {'#22C55E' if total_pl >= 0 else '#EF4444'}; padding: 15px; background: #121212; border-radius: 6px;">
-                    <div class="text-gray" style="color: #A3A3A3; font-size: 13px;">累计盈亏 (元)</div>
-                    <div class="huge-number" style="font-size: 36px; font-weight: 800; color: {'#22C55E' if total_pl >= 0 else '#EF4444'};">¥ {total_pl:,.2f}</div>
-                    <div class="peak-text-pos" style="color: #22C55E; font-size: 13px; margin-top: 5px;">最高: ¥ {s_peak_value:,.2f} ({s_peak_issue}期)</div>
-                    <div class="peak-text-neg" style="color: #EF4444; font-size: 13px; margin-top: 3px;">最低: ¥ {s_low_peak_value:,.2f} ({s_low_peak_issue}期)</div>
-                </div>
-                <div class="custom-card" style="margin-top: 10px; padding: 15px; background: #121212; border-radius: 6px;">
-                    <div class="text-gray" style="color: #A3A3A3; font-size: 13px;">胜率</div>
-                    <div class="huge-number" style="color: #FFF; font-size: 36px; font-weight: 800;">{win_rate:.1f}%</div>
-                    <div class="text-gray" style="color: #A3A3A3; font-size: 13px; margin-top: 5px;">命中 {win_periods} / 总 {len(res_df)} 期</div>
-                </div>
-                """, unsafe_allow_html=True)
-            
-            with col_res_right:
-                fig = px.line(res_df, x="期号", y="累计盈亏", markers=True, template="plotly_dark")
-                fig.update_layout(
-                    plot_bgcolor='rgba(0,0,0,0)', paper_bgcolor='rgba(0,0,0,0)', 
-                    height=st.session_state.chart_height + 30, margin=dict(l=10, r=10, t=25, b=5), 
-                    title=dict(text="单方案盈亏走势", font=dict(size=12, color="#A3A3A3")), 
-                    yaxis=dict(dtick=st.session_state.dtick_val)
-                )
-                fig.add_scatter(x=[s_peak_issue], y=[s_peak_value], mode='markers+text', text=[f"最高: {s_peak_value:,.0f}"], textposition="top center", marker=dict(size=8, color='#22C55E', symbol='star'), textfont=dict(color='#22C55E', size=10))
-                fig.add_scatter(x=[s_low_peak_issue], y=[s_low_peak_value], mode='markers+text', text=[f"最低: {s_low_peak_value:,.0f}"], textposition="bottom center", marker=dict(size=8, color='#EF4444', symbol='star'), textfont=dict(color='#EF4444', size=10))
-                fig.update_traces(selector=dict(type='scatter', mode='lines+markers'), line_color='#22C55E', line_width=2)
-                st.plotly_chart(fig, use_container_width=True, key=f"chart_{scheme['id']}")
+    selected_scheme_name = st.selectbox("选择要查看的方案", [s['name'] for s in active_schemes])
+    selected_scheme = next(s for s in active_schemes if s['name'] == selected_scheme_name)
+    
+    res_df = scheme_results.get(selected_scheme['id'])
+    if res_df is not None and not res_df.empty:
+        total_pl = res_df['本期盈亏'].sum()
+        win_periods = len(res_df[res_df['命中注数'] > 0])
+        win_rate = (win_periods / len(res_df) * 100) if len(res_df) > 0 else 0
+        
+        s_peak_value = res_df['累计盈亏'].max()
+        s_peak_issue = res_df.loc[res_df['累计盈亏'].idxmax(), '期号']
+        s_low_peak_value = res_df['累计盈亏'].min()
+        s_low_peak_issue = res_df.loc[res_df['累计盈亏'].idxmin(), '期号']
+        
+        col_res_left, col_res_right = st.columns([1.5, 3])
+        with col_res_left:
+            st.markdown(f"""
+            <div class="custom-card" style="border-left: 4px solid {'#22C55E' if total_pl >= 0 else '#EF4444'}; padding: 15px; background: #121212; border-radius: 6px;">
+                <div class="text-gray" style="color: #A3A3A3; font-size: 13px;">累计盈亏 (元)</div>
+                <div class="huge-number" style="font-size: 36px; font-weight: 800; color: {'#22C55E' if total_pl >= 0 else '#EF4444'};">¥ {total_pl:,.2f}</div>
+                <div class="peak-text-pos" style="color: #22C55E; font-size: 13px; margin-top: 5px;">最高: ¥ {s_peak_value:,.2f} ({s_peak_issue}期)</div>
+                <div class="peak-text-neg" style="color: #EF4444; font-size: 13px; margin-top: 3px;">最低: ¥ {s_low_peak_value:,.2f} ({s_low_peak_issue}期)</div>
+            </div>
+            <div class="custom-card" style="margin-top: 10px; padding: 15px; background: #121212; border-radius: 6px;">
+                <div class="text-gray" style="color: #A3A3A3; font-size: 13px;">胜率</div>
+                <div class="huge-number" style="color: #FFF; font-size: 36px; font-weight: 800;">{win_rate:.1f}%</div>
+                <div class="text-gray" style="color: #A3A3A3; font-size: 13px; margin-top: 5px;">命中 {win_periods} / 总 {len(res_df)} 期</div>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        with col_res_right:
+            fig = px.line(res_df, x="期号", y="累计盈亏", markers=True, template="plotly_dark")
+            fig.update_layout(
+                plot_bgcolor='rgba(0,0,0,0)', paper_bgcolor='rgba(0,0,0,0)', 
+                height=st.session_state.chart_height + 30, margin=dict(l=10, r=10, t=25, b=5), 
+                title=dict(text=f"{selected_scheme['name']} 盈亏走势", font=dict(size=12, color="#A3A3A3")), 
+                yaxis=dict(dtick=st.session_state.dtick_val)
+            )
+            fig.add_scatter(x=[s_peak_issue], y=[s_peak_value], mode='markers+text', text=[f"最高: {s_peak_value:,.0f}"], textposition="top center", marker=dict(size=8, color='#22C55E', symbol='star'), textfont=dict(color='#22C55E', size=10))
+            fig.add_scatter(x=[s_low_peak_issue], y=[s_low_peak_value], mode='markers+text', text=[f"最低: {s_low_peak_value:,.0f}"], textposition="bottom center", marker=dict(size=8, color='#EF4444', symbol='star'), textfont=dict(color='#EF4444', size=10))
+            fig.update_traces(selector=dict(type='scatter', mode='lines+markers'), line_color='#22C55E', line_width=2)
+            st.plotly_chart(fig, use_container_width=True, key=f"chart_single")
