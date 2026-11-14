@@ -92,7 +92,6 @@ LOTTERY_MAP = {
     "加拿大六合彩": {"code": "JNDLHC", "type": "gpc"}
 }
 
-# ✅ 核心优化：接收强制抓取的天数，抛弃所有无效的短路拦截
 def force_sync_until_today(lottery_name, force_days=3):
     config = LOTTERY_MAP.get(lottery_name)
     if not config: return "未知彩种"
@@ -100,15 +99,14 @@ def force_sync_until_today(lottery_name, force_days=3):
     end_date = datetime.today().date()
     
     try:
-        df_old = pd.read_sql(f"SELECT draw_time FROM lottery_data WHERE lottery_name = '{lottery_name}' ORDER BY draw_time DESC LIMIT 1", engine)
+        df_old = pd.read_sql(f"SELECT draw_time, issue FROM lottery_data WHERE lottery_name = '{lottery_name}' ORDER BY draw_time DESC LIMIT 1", engine)
         if df_old.empty:
             start_date = end_date - timedelta(days=30)
+            db_max_issue = 0
         else:
             max_date = pd.to_datetime(df_old.iloc[0]['draw_time']).date()
-            # 从最大日期往前推 1 天开始扫描，确保不漏掉最新那天的数据
+            db_max_issue = int(df_old.iloc[0]['issue']) # 强制转为整数，防字符串比对出错
             start_date = max_date - timedelta(days=1)
-            
-            # 如果数据库记录比今天还老太多，就强行往前扫 force_days 天
             if (end_date - max_date).days > force_days:
                 start_date = end_date - timedelta(days=force_days)
     except Exception as e:
@@ -147,29 +145,36 @@ def force_sync_until_today(lottery_name, force_days=3):
                 time.sleep(0.01)
 
     if not all_new_data:
-        return f"⚠️ 抓取失败: 接口本次未返回数据(可能官方还没更新)"
+        return f"⚠️ 抓取失败: 接口本次未返回任何数据"
 
     df_new = pd.DataFrame(all_new_data)
     df_new['issue'] = df_new['issue'].astype(str).str.strip()
+    
+    # ✅ 核心护城河：过滤掉接口返回的过期垃圾数据！
+    df_new['issue_int'] = pd.to_numeric(df_new['issue'], errors='coerce').fillna(0).astype(int)
+    df_new = df_new[df_new['issue_int'] > db_max_issue]
+    
+    if df_new.empty:
+        return f"✅ 已是最新（接口返回的数据未超过库内最新期 {db_max_issue}）"
+
     df_new['draw_time'] = pd.to_datetime(df_new['draw_time'], errors='coerce').dt.tz_localize(None)
     df_new = df_new.dropna(subset=['draw_time']).drop_duplicates(subset=['lottery_name', 'issue'], keep='first')
 
     try:
         existing = pd.read_sql(f"SELECT issue FROM lottery_data WHERE lottery_name = '{lottery_name}'", engine)['issue'].astype(str).str.strip().tolist()
         df_new = df_new[~df_new['issue'].isin(existing)]
-        
-        api_latest_issue = pd.DataFrame(all_new_data)['issue'].astype(str).str.strip().max()
 
         if not df_new.empty:
-            df_new.to_sql('lottery_data', engine, if_exists='append', index=False)
-            return f"✅ 成功获取并补齐了 {len(df_new)} 条数据！最新一期: {df_new.iloc[-1]['issue']}"
+            # 删除辅助列后再入库
+            df_to_save = df_new.drop(columns=['issue_int'])
+            df_to_save.to_sql('lottery_data', engine, if_exists='append', index=False)
+            return f"✅ 补齐完成，新增 {len(df_new)} 条！最新一期: {df_new['issue_int'].max()}"
         else:
-            return f"✅ 已是最新（接口最新期 {api_latest_issue} 已入库）"
+            return f"✅ 已是最新（接口数据已存在于库）"
     except Exception as e:
         return f"❌ 写入数据库失败: {e}"
 
 def auto_sync_data(lottery_name):
-    # 自动同步复用强制同步逻辑，强制向前回溯 3 天，保证高频低频都能抓到最新
     force_sync_until_today(lottery_name, force_days=3)
 
 # ================= 💾 方案云端保存 =================
@@ -413,7 +418,6 @@ with c_lottery:
     
     is_high_freq = ("宾果" in selected_lottery or "加拿大" in selected_lottery)
     
-    # ✅ 极致简化：无论高频低频，每次只要今天还没同步过，就强行同步一次
     sync_key = f"last_sync_{selected_lottery}"
     if st.session_state.get(sync_key) != today:
         with st.spinner("正在自动同步最新数据..."):
@@ -436,7 +440,6 @@ with c_lottery:
 with c_action:
     st.markdown("<div style='margin-top: 10px;'></div>", unsafe_allow_html=True)
     if st.button("立即手动补齐断档数据", use_container_width=True, type="primary"):
-        # 点击按钮强制抓取，不管库里有什么，直接往前抓 3 天
         msg = force_sync_until_today(selected_lottery, force_days=3)
         st.session_state.sync_msg = msg
         st.rerun()
@@ -512,203 +515,4 @@ def calculate_scheme_cached(df, scheme, time_filter=""):
         if cat == "特码类":
             pos_idx = scheme['pos_index'] - 1
             draw_num = row['正码'][pos_idx] if pos_idx < 6 else row['特码']
-            if draw_num in scheme['numbers']: hn = scheme['numbers'].count(draw_num)
-        elif cat == "连码复式":
-            nums = scheme['numbers']
-            if sub in ["3中3", "3中2"]:
-                for grp in itertools.combinations(nums, 3):
-                    match = sum(1 for n in grp if n in draw_normals)
-                    if sub == "3中3" and match == 3: hn += 1
-                    elif sub == "3中2":
-                        if match == 2: h2 += 1
-                        elif match == 3: h3 += 1
-            elif sub == "2中2":
-                for grp in itertools.combinations(nums, 2):
-                    if all(n in draw_normals for n in grp): hn += 1
-            elif sub == "特串":
-                for grp in itertools.combinations(nums, 2):
-                    n1, n2 = grp
-                    if (n1 in draw_normals and n2 == draw_special) or (n2 in draw_normals and n1 == draw_special):
-                        hn += 1
-        elif cat == "连码对碰":
-            L_nums, R_nums = scheme['numbers'], scheme['numbers2']
-            if sub == "2中2":
-                for l in L_nums:
-                    for r in R_nums:
-                        if l in draw_normals and r in draw_normals: hn += 1
-            elif sub == "特串":
-                for l in L_nums:
-                    for r in R_nums:
-                        if (l in draw_normals and r == draw_special) or (l == draw_special and r in draw_normals): hn += 1
-            elif sub in ["3中3", "3中2"]:
-                for l_pair in itertools.combinations(L_nums, 2):
-                    for r in R_nums:
-                        match = sum(1 for n in (list(l_pair) + [r]) if n in draw_normals)
-                        if sub == "3中3" and match == 3: hn += 1
-                        elif sub == "3中2":
-                            if match == 2: h2 += 1
-                            elif match == 3: h3 += 1
-                for l in L_nums:
-                    for r_pair in itertools.combinations(R_nums, 2):
-                        match = sum(1 for n in ([l] + list(r_pair)) if n in draw_normals)
-                        if sub == "3中3" and match == 3: hn += 1
-                        elif sub == "3中2":
-                            if match == 2: h2 += 1
-                            elif match == 3: h3 += 1
-
-        prize = (h2 * scheme['bet'] * scheme['odds_1'] + h3 * scheme['bet'] * scheme['odds_2']) if sub == "3中2" else (hn * scheme['bet'] * scheme['odds_1'])
-        pl = prize - actual_cost
-        total_hit = h2 + h3 if sub == "3中2" else hn
-        results.append({"期号": row['期号'], "开奖日期": row['开奖日期'], "正码": row['正码'], "特码": draw_special, "命中注数": total_hit, "本期盈亏": round(pl, 2)})
-        
-    res_df = pd.DataFrame(results)
-    if not res_df.empty: res_df['累计盈亏'] = res_df['本期盈亏'].cumsum()
-    return res_df
-
-# ================= 5. 测算结果展示 =================
-if not active_schemes:
-    st.info("请在左侧勾选至少一个方案以展示测算结果。")
-else:
-    df_filtered = df_all[(df_all["日期_only"] >= start_date) & (df_all["日期_only"] <= end_date)].copy()
-    if df_filtered.empty:
-        st.warning("当前日期范围内云端没有数据！请调整左侧时间范围。")
-        st.stop()
-        
-    df_filtered["正码"], df_filtered["特码"] = zip(*df_filtered.apply(parse_draw, axis=1))
-    
-    # 进度条初始化
-    total_schemes = len(active_schemes)
-    total_days = len(df_filtered)
-    progress_text = f"正在计算历史盈亏... (共 {total_days} 期数据)"
-    my_bar = st.progress(0, text=progress_text)
-    
-    scheme_results = {}
-    all_res_dfs = []
-    
-    for i, scheme in enumerate(active_schemes):
-        res = calculate_scheme_cached(df_filtered, scheme, "")
-        
-        scheme_results[scheme['id']] = res
-        
-        if not res.empty:
-            res['方案名称'] = scheme['name']
-            all_res_dfs.append(res)
-            
-        # 更新进度条
-        pct = int((i + 1) / total_schemes * 100)
-        my_bar.progress(
-            (i + 1) / total_schemes, 
-            text=f"正在计算方案: {scheme['name']} ({pct}%) | 已处理 {total_days} 期"
-        )
-        
-    my_bar.empty() # 算完后清除进度条
-    
-    if not all_res_dfs:
-        st.warning("当前过滤条件下无数据。")
-        st.stop()
-        
-    combined_df = pd.concat(all_res_dfs)
-    merged_pl = combined_df.groupby(['期号', '开奖日期']).agg({'命中注数': 'sum', '本期盈亏': 'sum'}).reset_index()
-    merged_pl['累计盈亏'] = merged_pl['本期盈亏'].cumsum()
-    total_combined_pl = merged_pl['本期盈亏'].sum()
-
-    peak_value = merged_pl['累计盈亏'].max()
-    peak_issue = merged_pl.loc[merged_pl['累计盈亏'].idxmax(), '期号']
-    low_peak_value = merged_pl['累计盈亏'].min()
-    low_peak_issue = merged_pl.loc[merged_pl['累计盈亏'].idxmin(), '期号']
-    
-    latest_pl = merged_pl.iloc[-1]['累计盈亏']
-    
-    alert_pos_val = st.session_state.pos_alert
-    alert_neg_val = st.session_state.neg_alert
-    
-    trigger_pos = (alert_pos_val != 0) and (latest_pl >= alert_pos_val)
-    trigger_neg = (alert_neg_val != 0) and (latest_pl <= alert_neg_val)
-    
-    if trigger_pos or trigger_neg:
-        play_beep_sound()
-        if trigger_pos and trigger_neg:
-            st.error(f"🚨 **极度波动报警！** 最新累计盈亏 ¥{latest_pl:,.2f} 同时突破了止盈(¥{alert_pos_val:,.2f})和止损(¥{alert_neg_val:,.2f})线。")
-        elif trigger_pos:
-            st.success(f"🎉 **止盈报警！** 最新累计盈亏 ¥{latest_pl:,.2f} 突破正峰值报警线 (设定线: ¥{alert_pos_val:,.2f})")
-        elif trigger_neg:
-            st.warning(f"⚠️ **止损报警！** 最新累计盈亏 ¥{latest_pl:,.2f} 跌破负峰值报警线 (设定线: ¥{alert_neg_val:,.2f})")
-
-    active_groups = set([s.get('group_name','').strip() for s in active_schemes if s.get('group_name','').strip()])
-    combined_names = list(active_groups)[0] if active_groups and len(active_groups) == 1 else " + ".join([s['name'] for s in active_schemes])
-    
-    st.markdown(f"### 合并总盈亏 ({combined_names})")
-    
-    c_mid, c_right = st.columns([1.5, 3])
-    with c_mid:
-        st.markdown(f"""
-        <div class="custom-card" style="border-left: 4px solid {'#22C55E' if total_combined_pl >= 0 else '#EF4444'}; padding: 15px; background: #121212; border-radius: 6px;">
-            <div class="text-gray" style="color: #A3A3A3; font-size: 13px;">合计盈亏 (元)</div>
-            <div class="huge-number" style="font-size: 36px; font-weight: 800; color: {'#22C55E' if total_combined_pl >= 0 else '#EF4444'};">¥ {total_combined_pl:,.2f}</div>
-            <div class="peak-text-pos" style="color: #22C55E; font-size: 13px; margin-top: 5px;">最高: ¥ {peak_value:,.2f} ({peak_issue}期)</div>
-            <div class="peak-text-neg" style="color: #EF4444; font-size: 13px; margin-top: 3px;">最低: ¥ {low_peak_value:,.2f} ({low_peak_issue}期)</div>
-        </div>
-        """, unsafe_allow_html=True)
-    
-    with c_right:
-        fig_combined = px.line(merged_pl, x="期号", y="累计盈亏", markers=True, template="plotly_dark")
-        fig_combined.update_layout(
-            plot_bgcolor='rgba(0,0,0,0)', paper_bgcolor='rgba(0,0,0,0)', 
-            height=st.session_state.chart_height, margin=dict(l=10, r=10, t=25, b=5), 
-            title=dict(text="合并总盈亏走势", font=dict(size=12, color="#A3A3A3")), 
-            yaxis=dict(dtick=st.session_state.dtick_val)
-        )
-        fig_combined.add_scatter(x=[peak_issue], y=[peak_value], mode='markers+text', text=[f"最高: {peak_value:,.0f}"], textposition="top center", marker=dict(size=8, color='#22C55E', symbol='star'), textfont=dict(color='#22C55E', size=10))
-        fig_combined.add_scatter(x=[low_peak_issue], y=[low_peak_value], mode='markers+text', text=[f"最低: {low_peak_value:,.0f}"], textposition="bottom center", marker=dict(size=8, color='#EF4444', symbol='star'), textfont=dict(color='#EF4444', size=10))
-        fig_combined.update_traces(selector=dict(type='scatter', mode='lines+markers'), line_color='#38BDF8', line_width=2, marker=dict(size=5, color='#38BDF8'))
-        st.plotly_chart(fig_combined, use_container_width=True, key="chart_combined")
-
-    with st.expander("查看合并每日明细记录", expanded=False):
-        st.dataframe(merged_pl, use_container_width=True, hide_index=True, height=200)
-    
-    st.markdown("---")
-    st.markdown("### 各方案独立明细")
-    
-    tabs = st.tabs([s['name'] for s in active_schemes])
-    for idx, scheme in enumerate(active_schemes):
-        with tabs[idx]:
-            res_df = scheme_results.get(scheme['id'])
-            if res_df is None or res_df.empty: continue
-            
-            total_pl = res_df['本期盈亏'].sum()
-            win_periods = len(res_df[res_df['命中注数'] > 0])
-            win_rate = (win_periods / len(res_df) * 100) if len(res_df) > 0 else 0
-            
-            s_peak_value = res_df['累计盈亏'].max()
-            s_peak_issue = res_df.loc[res_df['累计盈亏'].idxmax(), '期号']
-            s_low_peak_value = res_df['累计盈亏'].min()
-            s_low_peak_issue = res_df.loc[res_df['累计盈亏'].idxmin(), '期号']
-            
-            col_res_left, col_res_right = st.columns([1.5, 3])
-            with col_res_left:
-                st.markdown(f"""
-                <div class="custom-card" style="border-left: 4px solid {'#22C55E' if total_pl >= 0 else '#EF4444'}; padding: 15px; background: #121212; border-radius: 6px;">
-                    <div class="text-gray" style="color: #A3A3A3; font-size: 13px;">累计盈亏 (元)</div>
-                    <div class="huge-number" style="font-size: 36px; font-weight: 800; color: {'#22C55E' if total_pl >= 0 else '#EF4444'};">¥ {total_pl:,.2f}</div>
-                    <div class="peak-text-pos" style="color: #22C55E; font-size: 13px; margin-top: 5px;">最高: ¥ {s_peak_value:,.2f} ({s_peak_issue}期)</div>
-                    <div class="peak-text-neg" style="color: #EF4444; font-size: 13px; margin-top: 3px;">最低: ¥ {s_low_peak_value:,.2f} ({s_low_peak_issue}期)</div>
-                </div>
-                <div class="custom-card" style="margin-top: 10px; padding: 15px; background: #121212; border-radius: 6px;">
-                    <div class="text-gray" style="color: #A3A3A3; font-size: 13px;">胜率</div>
-                    <div class="huge-number" style="color: #FFF; font-size: 36px; font-weight: 800;">{win_rate:.1f}%</div>
-                    <div class="text-gray" style="color: #A3A3A3; font-size: 13px; margin-top: 5px;">命中 {win_periods} / 总 {len(res_df)} 期</div>
-                </div>
-                """, unsafe_allow_html=True)
-            
-            with col_res_right:
-                fig = px.line(res_df, x="期号", y="累计盈亏", markers=True, template="plotly_dark")
-                fig.update_layout(
-                    plot_bgcolor='rgba(0,0,0,0)', paper_bgcolor='rgba(0,0,0,0)', 
-                    height=st.session_state.chart_height + 30, margin=dict(l=10, r=10, t=25, b=5), 
-                    title=dict(text="单方案盈亏走势", font=dict(size=12, color="#A3A3A3")), 
-                    yaxis=dict(dtick=st.session_state.dtick_val)
-                )
-                fig.add_scatter(x=[s_peak_issue], y=[s_peak_value], mode='markers+text', text=[f"最高: {s_peak_value:,.0f}"], textposition="top center", marker=dict(size=8, color='#22C55E', symbol='star'), textfont=dict(color='#22C55E', size=10))
-                fig.add_scatter(x=[s_low_peak_issue], y=[s_low_peak_value], mode='markers+text', text=[f"最低: {s_low_peak_value:,.0f}"], textposition="bottom center", marker=dict(size=8, color='#EF4444', symbol='star'), textfont=dict(color='#EF4444', size=10))
-                fig.update_traces(selector=dict(type='scatter', mode='lines+markers'), line_color='#22C55E', line_width=2)
-                st.plotly_chart(fig, use_container_width=True, key=f"chart_{scheme['id']}")
+            if draw_num in scheme['numbers']: hn =
