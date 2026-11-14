@@ -92,7 +92,89 @@ LOTTERY_MAP = {
     "加拿大六合彩": {"code": "JNDLHC", "type": "gpc"}
 }
 
+def force_sync_until_today(lottery_name):
+    """智能断档补齐：自动检测本地库最新日期，补齐到今天"""
+    config = LOTTERY_MAP.get(lottery_name)
+    if not config: return "未知彩种"
+    
+    end_date = datetime.today().date()
+    
+    # 1. 查库里最新的一期是哪天
+    try:
+        df_old = pd.read_sql(f"SELECT draw_time FROM lottery_data WHERE lottery_name = '{lottery_name}' ORDER BY draw_time DESC LIMIT 1", engine)
+        if df_old.empty:
+            start_date = end_date - timedelta(days=30) # 空库默认抓30天
+        else:
+            max_date = pd.to_datetime(df_old.iloc[0]['draw_time']).date()
+            if max_date >= end_date:
+                return "✅ 已是最新 (本地已有今天的开奖数据)"
+            start_date = max_date
+    except Exception as e:
+        return f"❌ 读取数据库失败: {e}"
+
+    delta_days = (end_date - start_date).days + 1
+    
+    # 💡 安全阀：为了防止断档半年后点击导致请求爆炸被封IP，最多往回抓60天
+    if delta_days > 60:
+        start_date = end_date - timedelta(days=60)
+        delta_days = 61
+        limit_msg = " (因断档过久，为防封禁仅补齐最近60天)"
+    else:
+        limit_msg = ""
+    
+    all_new_data = []
+    error_logs = []
+    headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://166w2.com/"}
+    
+    for day_offset in range(delta_days):
+        target_date = start_date + timedelta(days=day_offset)
+        y, m, d = target_date.strftime("%Y"), target_date.month, target_date.day
+        
+        if config["type"] == "dpc":
+            url = f"https://data.kai8.us/api/lottery/history_dpc/KAI166/{config['code']}/{y}/{m}/{d}"
+            try:
+                res = requests.get(url, headers=headers, timeout=5)
+                if res.status_code == 200:
+                    for item in res.json().get("data", {}).get("list", []):
+                        all_new_data.append({"lottery_name": lottery_name, "issue": str(item.get("issue")).strip(), "draw_time": item.get("draw_time"), "draw_code": item.get("draw_code")})
+                else:
+                    error_logs.append(f"{target_date} HTTP:{res.status_code}")
+            except Exception as e:
+                error_logs.append(f"{target_date} 异常:{str(e)[:20]}")
+            time.sleep(0.02)
+        else:
+            for h in range(24):
+                url = f"https://data.kai8.us/api/lottery/history_gpc/KAI166/{config['code']}/{y}-{m:02d}-{d:02d}/{h}/30"
+                try:
+                    res = requests.get(url, headers=headers, timeout=5)
+                    if res.status_code == 200:
+                        for item in res.json().get("data", {}).get("list", []):
+                            all_new_data.append({"lottery_name": lottery_name, "issue": str(item.get("issue")).strip(), "draw_time": item.get("draw_time"), "draw_code": item.get("draw_code")})
+                except Exception: pass
+                time.sleep(0.01)
+
+    if not all_new_data:
+        err_msg = "; ".join(error_logs[:3]) if error_logs else "接口未返回任何数据(可能官方还没更新)"
+        return f"⚠️ 抓取失败: {err_msg}"
+
+    df_new = pd.DataFrame(all_new_data)
+    df_new['issue'] = df_new['issue'].astype(str).str.strip()
+    df_new['draw_time'] = pd.to_datetime(df_new['draw_time'], errors='coerce').dt.tz_localize(None)
+    df_new = df_new.dropna(subset=['draw_time']).drop_duplicates(subset=['lottery_name', 'issue'], keep='first')
+
+    try:
+        existing = pd.read_sql(f"SELECT issue FROM lottery_data WHERE lottery_name = '{lottery_name}'", engine)['issue'].astype(str).str.strip().tolist()
+        df_new = df_new[~df_new['issue'].isin(existing)]
+        if not df_new.empty:
+            df_new.to_sql('lottery_data', engine, if_exists='append', index=False)
+            return f"✅ 补齐完成！扫描了 {start_date} 至 {end_date}，新增 {len(df_new)} 条数据。最新一期: {df_new.iloc[-1]['issue']}{limit_msg}"
+        else:
+            return f"已是最新 (扫描范围内数据均已存在，官网可能尚未开奖){limit_msg}"
+    except Exception as e:
+        return f"❌ 写入数据库失败: {e}"
+
 def auto_sync_data(lottery_name):
+    """后台静默增量同步（仅针对最新一天，用于高频彩自动刷新）"""
     config = LOTTERY_MAP.get(lottery_name)
     if not config: return False
     end_date = datetime.today().date()
@@ -102,7 +184,6 @@ def auto_sync_data(lottery_name):
     except Exception: return False
 
     if start_date > end_date: return False
-    
     delta_days = (end_date - start_date).days + 1
     if delta_days > 30: start_date, delta_days = end_date - timedelta(days=30), 31
         
@@ -182,6 +263,8 @@ if 'schemes' not in st.session_state:
     st.session_state.schemes = load_schemes() 
 if 'editing_id' not in st.session_state: 
     st.session_state.editing_id = None
+if 'sync_msg' not in st.session_state:
+    st.session_state.sync_msg = None
 
 # URL 记忆
 if "chart_height" not in st.session_state: st.session_state.chart_height = int(st.query_params.get("chart_height", 350))
@@ -217,30 +300,25 @@ last_month_end = this_month_start - timedelta(days=1)
 last_month_start = last_month_end.replace(day=1)
 this_year_start = today.replace(month=1, day=1)
 
-# 💡 初始化 session_state 中的日期控件值（只执行一次）
 if 'start_date_widget' not in st.session_state:
     st.session_state.start_date_widget = this_month_start
 if 'end_date_widget' not in st.session_state:
     st.session_state.end_date_widget = today
 
-# 💡 点击按钮时，直接修改控件的 key，强制 UI 刷新
 def set_dates(s_date, e_date):
     st.session_state.start_date_widget = s_date
     st.session_state.end_date_widget = e_date
 
-# 第一排按钮
 c1, c2, c3 = st.sidebar.columns(3)
 if c1.button("今天", use_container_width=True): set_dates(today, today)
 if c2.button("本周", use_container_width=True): set_dates(this_week_start, today)
 if c3.button("上周", use_container_width=True): set_dates(last_week_start, last_week_end)
 
-# 第二排按钮
 c4, c5, c6 = st.sidebar.columns(3)
 if c4.button("本月", use_container_width=True): set_dates(this_month_start, today)
 if c5.button("上月", use_container_width=True): set_dates(last_month_start, last_month_end)
 if c6.button("今年", use_container_width=True): set_dates(this_year_start, today)
 
-# 💡 控件只绑定 key，不写 value，这样 Streamlit 会自动从 session_state 取值并展示
 start_date = st.sidebar.date_input("开始日期", key="start_date_widget")
 end_date = st.sidebar.date_input("结束日期", key="end_date_widget")
 
@@ -411,9 +489,21 @@ with c_lottery:
 
 with c_action:
     st.markdown("<div style='margin-top: 10px;'></div>", unsafe_allow_html=True)
-    if st.button("立即手动刷新数据", use_container_width=True, type="primary"):
-        auto_sync_data(selected_lottery)
+    if st.button("立即手动补齐断档数据", use_container_width=True, type="primary"):
+        # 💡 调用智能断档补齐函数
+        msg = force_sync_until_today(selected_lottery)
+        st.session_state.sync_msg = msg
         st.rerun()
+
+# 💡 显示抓取结果提示
+if st.session_state.sync_msg:
+    if "✅" in st.session_state.sync_msg:
+        st.success(st.session_state.sync_msg)
+    elif "⚠️" in st.session_state.sync_msg or "❌" in st.session_state.sync_msg:
+        st.error(st.session_state.sync_msg)
+    else:
+        st.info(st.session_state.sync_msg)
+    st.session_state.sync_msg = None
 
 if not df_all.empty:
     latest_row = df_all.iloc[-1]
@@ -540,7 +630,7 @@ else:
         
     df_filtered["正码"], df_filtered["特码"] = zip(*df_filtered.apply(parse_draw, axis=1))
     
-    # 💡 进度条初始化
+    # 进度条初始化
     total_schemes = len(active_schemes)
     total_days = len(df_filtered)
     progress_text = f"正在计算历史盈亏... (共 {total_days} 期数据)"
@@ -558,7 +648,7 @@ else:
             res['方案名称'] = scheme['name']
             all_res_dfs.append(res)
             
-        # 💡 更新进度条
+        # 更新进度条
         pct = int((i + 1) / total_schemes * 100)
         my_bar.progress(
             (i + 1) / total_schemes, 
