@@ -415,13 +415,14 @@ with st.sidebar.expander(form_title, expanded=is_editing):
 
 active_schemes = []
 def render_scheme_row(s):
-    c1, c2, c3 = st.columns([3, 1, 1])
+    c1, c2, c3 = st.columns([3, 1.2, 1.2])
     is_active = c1.checkbox(s['name'], value=s['active'], key=f"chk_{s['id']}")
     if is_active != s['active']: 
         s['active'] = is_active
         save_scheme_to_db(s)
-    if c2.button("改", key=f"e_{s['id']}"): st.session_state.editing_id = s['id']; st.rerun()
-    if c3.button("删", key=f"d_{s['id']}"):
+    if c2.button("改", key=f"e_{s['id']}", use_container_width=True): 
+        st.session_state.editing_id = s['id']; st.rerun()
+    if c3.button("删", key=f"d_{s['id']}", use_container_width=True):
         st.session_state.schemes = [x for x in st.session_state.schemes if x['id'] != s['id']]
         delete_scheme_from_db(s['id']) 
         st.rerun()
@@ -443,11 +444,13 @@ if st.session_state.schemes:
                 if col_a.button("✅ 全选", key=f"sel_all_{g_name}", use_container_width=True):
                     for s in s_list:
                         s['active'] = True
+                        st.session_state[f"chk_{s['id']}"] = True
                         save_scheme_to_db(s)
                     st.rerun()
                 if col_b.button("❌ 取消", key=f"desel_all_{g_name}", use_container_width=True):
                     for s in s_list:
                         s['active'] = False
+                        st.session_state[f"chk_{s['id']}"] = False
                         save_scheme_to_db(s)
                     st.rerun()
                     
@@ -628,18 +631,80 @@ else:
     my_bar = st.progress(0, text=progress_text)
     
     scheme_results = {}
+    all_res_dfs = []
     
     for i, scheme in enumerate(active_schemes):
         res = calculate_scheme_cached(df_filtered, scheme, "")
         scheme_results[scheme['id']] = res
-        
+        if not res.empty:
+            res['方案名称'] = scheme['name']
+            all_res_dfs.append(res)
+            
         pct = int((i + 1) / total_schemes * 100)
         my_bar.progress((i + 1) / total_schemes, text=f"正在计算方案: {scheme['name']} ({pct}%) | 已处理 {total_days} 期")
         
     my_bar.empty()
 
+    # ================= 🚀 新增：全局合并顶图 =================
+    if all_res_dfs:
+        combined_all_df = pd.concat(all_res_dfs)
+        global_merged = combined_all_df.groupby(['期号', '开奖日期']).agg({'命中注数': 'sum', '本期盈亏': 'sum'}).reset_index()
+        global_merged['累计盈亏'] = global_merged['本期盈亏'].cumsum()
+        global_total_pl = global_merged['本期盈亏'].sum()
+
+        global_peak_val = global_merged['累计盈亏'].max()
+        global_peak_issue = global_merged.loc[global_merged['累计盈亏'].idxmax(), '期号']
+        global_low_peak_val = global_merged['累计盈亏'].min()
+        global_low_peak_issue = global_merged.loc[global_merged['累计盈亏'].idxmin(), '期号']
+        global_latest_pl = global_merged.iloc[-1]['累计盈亏']
+
+        # 全局报警
+        alert_pos_val = st.session_state.pos_alert
+        alert_neg_val = st.session_state.neg_alert
+        trigger_pos = (alert_pos_val != 0) and (global_latest_pl >= alert_pos_val)
+        trigger_neg = (alert_neg_val != 0) and (global_latest_pl <= alert_neg_val)
+        
+        if trigger_pos or trigger_neg:
+            play_beep_sound()
+            if trigger_pos and trigger_neg:
+                st.error(f"🚨 **极度波动报警！** [全局合计] 最新累计盈亏 ¥{global_latest_pl:,.2f} 同时突破了止盈(¥{alert_pos_val:,.2f})和止损(¥{alert_neg_val:,.2f})线。")
+            elif trigger_pos:
+                st.success(f"🎉 **止盈报警！** [全局合计] 最新累计盈亏 ¥{global_latest_pl:,.2f} 突破正峰值报警线 (设定线: ¥{alert_pos_val:,.2f})")
+            elif trigger_neg:
+                st.warning(f"⚠️ **止损报警！** [全局合计] 最新累计盈亏 ¥{global_latest_pl:,.2f} 跌破负峰值报警线 (设定线: ¥{alert_neg_val:,.2f})")
+
+        st.markdown(f"### 🌟 全局方案合并总盈亏")
+        
+        c_mid, c_right = st.columns([1.5, 3])
+        with c_mid:
+            st.markdown(f"""
+            <div class="custom-card" style="border-left: 4px solid {'#22C55E' if global_total_pl >= 0 else '#EF4444'}; padding: 15px; background: #121212; border-radius: 6px;">
+                <div class="text-gray" style="color: #A3A3A3; font-size: 13px;">合计盈亏 (元)</div>
+                <div class="huge-number" style="font-size: 36px; font-weight: 800; color: {'#22C55E' if global_total_pl >= 0 else '#EF4444'};">¥ {global_total_pl:,.2f}</div>
+                <div class="peak-text-pos" style="color: #22C55E; font-size: 13px; margin-top: 5px;">最高: ¥ {global_peak_val:,.2f} ({global_peak_issue}期)</div>
+                <div class="peak-text-neg" style="color: #EF4444; font-size: 13px; margin-top: 3px;">最低: ¥ {global_low_peak_val:,.2f} ({global_low_peak_issue}期)</div>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        with c_right:
+            fig_global = px.line(global_merged, x="期号", y="累计盈亏", markers=True, template="plotly_dark")
+            fig_global.update_layout(
+                plot_bgcolor='rgba(0,0,0,0)', paper_bgcolor='rgba(0,0,0,0)', 
+                height=st.session_state.chart_height, margin=dict(l=10, r=10, t=25, b=5), 
+                title=dict(text="全局合并总盈亏走势", font=dict(size=12, color="#A3A3A3")), 
+                yaxis=dict(dtick=st.session_state.dtick_val)
+            )
+            fig_global.add_scatter(x=[global_peak_issue], y=[global_peak_val], mode='markers+text', text=[f"最高: {global_peak_val:,.0f}"], textposition="top center", marker=dict(size=8, color='#22C55E', symbol='star'), textfont=dict(color='#22C55E', size=10))
+            fig_global.add_scatter(x=[global_low_peak_issue], y=[global_low_peak_val], mode='markers+text', text=[f"最低: {global_low_peak_val:,.0f}"], textposition="bottom center", marker=dict(size=8, color='#EF4444', symbol='star'), textfont=dict(color='#EF4444', size=10))
+            fig_global.update_traces(selector=dict(type='scatter', mode='lines+markers'), line_color='#38BDF8', line_width=2, marker=dict(size=5, color='#38BDF8'))
+            st.plotly_chart(fig_global, use_container_width=True, key="chart_global")
+
+        with st.expander("查看全局每日明细记录", expanded=False):
+            st.dataframe(global_merged, use_container_width=True, hide_index=True, height=200)
+
+        st.markdown("<br><hr><br>", unsafe_allow_html=True)
+
     # ================= 大方案独立出图 =================
-    # 按 group_name 分组
     grouped_active = {}
     for s in active_schemes:
         g_name = s.get('group_name', '').strip() or "未分组"
@@ -667,7 +732,6 @@ else:
         
         g_latest_pl = g_merged.iloc[-1]['累计盈亏']
 
-        # 报警逻辑
         alert_pos_val = st.session_state.pos_alert
         alert_neg_val = st.session_state.neg_alert
         trigger_pos = (alert_pos_val != 0) and (g_latest_pl >= alert_pos_val)
