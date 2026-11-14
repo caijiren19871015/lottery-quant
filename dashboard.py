@@ -86,11 +86,28 @@ def play_beep_sound():
 
 # ================= 🔄 数据同步逻辑 =================
 LOTTERY_MAP = {
-    "香港六合彩": {"code": "HK6", "type": "dpc"},
-    "快乐8六合彩": {"code": "KLLHC", "type": "dpc"},
-    "宾果六合彩": {"code": "TWBGLHC", "type": "gpc"},
-    "加拿大六合彩": {"code": "JNDLHC", "type": "gpc"}
+    "香港六合彩": {"code": "hklhc", "type": "dpc"},        # 135ka.com 的香港代码
+    "快乐8六合彩": {"code": "fkl", "type": "dpc"},         # 135ka.com 的快8代码
+    "宾果六合彩": {"code": "TWBGLHC", "type": "gpc"},      # KAI8 的宾果
+    "加拿大六合彩": {"code": "JNDLHC", "type": "gpc"}      # KAI8 的加拿大
 }
+
+def fetch_135ka(code, page=1):
+    """专门抓取 135ka.com 的按序接口"""
+    url = "https://135ka.com/index.php/index/lhc/getdata2.html"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Referer": f"https://135ka.com/index.php/index/lhc.html?t={code}",
+        "X-Requested-With": "XMLHttpRequest"
+    }
+    payload = {"lotCode": code, "ltype": 3, "date": "", "page": page}
+    try:
+        res = requests.post(url, headers=headers, data=payload, timeout=5)
+        if res.status_code == 200:
+            return res.json().get("data", [])
+    except Exception:
+        pass
+    return []
 
 def force_sync_until_today(lottery_name):
     """智能断档补齐：自动检测本地库最新日期，补齐到今天"""
@@ -103,7 +120,7 @@ def force_sync_until_today(lottery_name):
     try:
         df_old = pd.read_sql(f"SELECT draw_time FROM lottery_data WHERE lottery_name = '{lottery_name}' ORDER BY draw_time DESC LIMIT 1", engine)
         if df_old.empty:
-            start_date = end_date - timedelta(days=30) # 空库默认抓30天
+            start_date = end_date - timedelta(days=30)
         else:
             max_date = pd.to_datetime(df_old.iloc[0]['draw_time']).date()
             if max_date >= end_date:
@@ -113,40 +130,43 @@ def force_sync_until_today(lottery_name):
         return f"❌ 读取数据库失败: {e}"
 
     delta_days = (end_date - start_date).days + 1
-    
-    # 💡 安全阀：为了防止断档半年后点击导致请求爆炸被封IP，最多往回抓60天
-    if delta_days > 60:
-        start_date = end_date - timedelta(days=60)
-        delta_days = 61
-        limit_msg = " (因断档过久，为防封禁仅补齐最近60天)"
-    else:
-        limit_msg = ""
+    limit_msg = ""
     
     all_new_data = []
     error_logs = []
-    headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://166w2.com/"}
-    
-    for day_offset in range(delta_days):
-        target_date = start_date + timedelta(days=day_offset)
-        y, m, d = target_date.strftime("%Y"), target_date.month, target_date.day
-        
-        if config["type"] == "dpc":
-            url = f"https://data.kai8.us/api/lottery/history_dpc/KAI166/{config['code']}/{y}/{m}/{d}"
-            try:
-                res = requests.get(url, headers=headers, timeout=5)
-                if res.status_code == 200:
-                    for item in res.json().get("data", {}).get("list", []):
-                        all_new_data.append({"lottery_name": lottery_name, "issue": str(item.get("issue")).strip(), "draw_time": item.get("draw_time"), "draw_code": item.get("draw_code")})
-                else:
-                    error_logs.append(f"{target_date} HTTP:{res.status_code}")
-            except Exception as e:
-                error_logs.append(f"{target_date} 异常:{str(e)[:20]}")
-            time.sleep(0.02)
-        else:
+
+    if config["type"] == "dpc" and lottery_name in ["香港六合彩", "快乐8六合彩"]:
+        # 💡 使用 135ka 的按序接口
+        page = 1
+        has_more = True
+        while has_more:
+            records = fetch_135ka(config["code"], page)
+            if not records:
+                break
+            for item in records:
+                draw_date = pd.to_datetime(item.get("date")).date()
+                # 只取需要的日期范围
+                if start_date <= draw_date <= end_date:
+                    all_new_data.append({
+                        "lottery_name": lottery_name,
+                        "issue": str(item.get("kithe")).strip(),
+                        "draw_time": item.get("date"),
+                        "draw_code": item.get("number")
+                    })
+                elif draw_date < start_date:
+                    has_more = False
+                    break
+            page += 1
+            time.sleep(0.5)
+    else:
+        # 高频彩维持原样 (KAI8)
+        for day_offset in range(delta_days):
+            target_date = start_date + timedelta(days=day_offset)
+            y, m, d = target_date.strftime("%Y"), target_date.month, target_date.day
             for h in range(24):
                 url = f"https://data.kai8.us/api/lottery/history_gpc/KAI166/{config['code']}/{y}-{m:02d}-{d:02d}/{h}/30"
                 try:
-                    res = requests.get(url, headers=headers, timeout=5)
+                    res = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=5)
                     if res.status_code == 200:
                         for item in res.json().get("data", {}).get("list", []):
                             all_new_data.append({"lottery_name": lottery_name, "issue": str(item.get("issue")).strip(), "draw_time": item.get("draw_time"), "draw_code": item.get("draw_code")})
@@ -167,16 +187,21 @@ def force_sync_until_today(lottery_name):
         df_new = df_new[~df_new['issue'].isin(existing)]
         if not df_new.empty:
             df_new.to_sql('lottery_data', engine, if_exists='append', index=False)
-            return f"✅ 补齐完成！扫描了 {start_date} 至 {end_date}，新增 {len(df_new)} 条数据。最新一期: {df_new.iloc[-1]['issue']}{limit_msg}"
+            return f"✅ 补齐完成！本次新增 {len(df_new)} 条数据。最新一期: {df_new.iloc[-1]['issue']}{limit_msg}"
         else:
             return f"已是最新 (扫描范围内数据均已存在，官网可能尚未开奖){limit_msg}"
     except Exception as e:
         return f"❌ 写入数据库失败: {e}"
 
 def auto_sync_data(lottery_name):
-    """后台静默增量同步（仅针对最新一天，用于高频彩自动刷新）"""
+    """后台静默增量同步"""
     config = LOTTERY_MAP.get(lottery_name)
     if not config: return False
+
+    # 如果是传统彩，依赖 135ka，直接不静默自动同步（留给用户手动点按钮），防止封 IP
+    if config["type"] == "dpc" and lottery_name in ["香港六合彩", "快乐8六合彩"]:
+        return False
+
     end_date = datetime.today().date()
     try:
         df_old = pd.read_sql(f"SELECT draw_time FROM lottery_data WHERE lottery_name = '{lottery_name}' ORDER BY draw_time DESC LIMIT 1", engine)
@@ -188,29 +213,18 @@ def auto_sync_data(lottery_name):
     if delta_days > 30: start_date, delta_days = end_date - timedelta(days=30), 31
         
     all_new_data = []
-    headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://166w2.com/"}
     for day_offset in range(delta_days):
         target_date = start_date + timedelta(days=day_offset)
         y, m, d = target_date.strftime("%Y"), target_date.month, target_date.day
-        if config["type"] == "dpc":
-            url = f"https://data.kai8.us/api/lottery/history_dpc/KAI166/{config['code']}/{y}/{m}/{d}"
+        for h in range(24):
+            url = f"https://data.kai8.us/api/lottery/history_gpc/KAI166/{config['code']}/{y}-{m:02d}-{d:02d}/{h}/30"
             try:
-                res = requests.get(url, headers=headers, timeout=5)
+                res = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=5)
                 if res.status_code == 200:
                     for item in res.json().get("data", {}).get("list", []):
                         all_new_data.append({"lottery_name": lottery_name, "issue": str(item.get("issue")).strip(), "draw_time": item.get("draw_time"), "draw_code": item.get("draw_code")})
             except Exception: pass
-            time.sleep(0.02)
-        else:
-            for h in range(24):
-                url = f"https://data.kai8.us/api/lottery/history_gpc/KAI166/{config['code']}/{y}-{m:02d}-{d:02d}/{h}/30"
-                try:
-                    res = requests.get(url, headers=headers, timeout=5)
-                    if res.status_code == 200:
-                        for item in res.json().get("data", {}).get("list", []):
-                            all_new_data.append({"lottery_name": lottery_name, "issue": str(item.get("issue")).strip(), "draw_time": item.get("draw_time"), "draw_code": item.get("draw_code")})
-                except Exception: pass
-                time.sleep(0.01)
+            time.sleep(0.01)
     if not all_new_data: return False
     
     df_new = pd.DataFrame(all_new_data)
@@ -259,14 +273,10 @@ def load_schemes():
         st.error(f"🚨 读取方案失败，请检查云端数据库连接！ {e}")
         return []
 
-if 'schemes' not in st.session_state: 
-    st.session_state.schemes = load_schemes() 
-if 'editing_id' not in st.session_state: 
-    st.session_state.editing_id = None
-if 'sync_msg' not in st.session_state:
-    st.session_state.sync_msg = None
+if 'schemes' not in st.session_state: st.session_state.schemes = load_schemes() 
+if 'editing_id' not in st.session_state: st.session_state.editing_id = None
+if 'sync_msg' not in st.session_state: st.session_state.sync_msg = None
 
-# URL 记忆
 if "chart_height" not in st.session_state: st.session_state.chart_height = int(st.query_params.get("chart_height", 350))
 if "dtick_val" not in st.session_state: st.session_state.dtick_val = int(st.query_params.get("dtick_val", 10000))
 if "pos_alert" not in st.session_state: st.session_state.pos_alert = float(st.query_params.get("pos_alert", 0.0))
@@ -291,7 +301,6 @@ st.sidebar.markdown("**📅 快捷时间**")
 
 import calendar
 today = datetime.today().date()
-
 this_week_start = today - timedelta(days=today.weekday())
 last_week_start = this_week_start - timedelta(days=7)
 last_week_end = this_week_start - timedelta(days=1)
@@ -300,10 +309,8 @@ last_month_end = this_month_start - timedelta(days=1)
 last_month_start = last_month_end.replace(day=1)
 this_year_start = today.replace(month=1, day=1)
 
-if 'start_date_widget' not in st.session_state:
-    st.session_state.start_date_widget = this_month_start
-if 'end_date_widget' not in st.session_state:
-    st.session_state.end_date_widget = today
+if 'start_date_widget' not in st.session_state: st.session_state.start_date_widget = this_month_start
+if 'end_date_widget' not in st.session_state: st.session_state.end_date_widget = today
 
 def set_dates(s_date, e_date):
     st.session_state.start_date_widget = s_date
@@ -362,12 +369,7 @@ with st.sidebar.expander(form_title, expanded=is_editing):
     elif category == "连码复式":
         sub_cat = st.selectbox("玩法细分", ["3中3", "3中2", "2中2", "特串"], index=["3中3", "3中2", "2中2", "特串"].index(def_sub) if def_sub in ["3中3", "3中2", "2中2", "特串"] else 0)
         numbers_str = st.text_input("号码池", value=def_nums)
-        
-        if sub_cat == "特串":
-            numbers2_str = "" 
-        else:
-            numbers2_str = ""
-            
+        numbers2_str = "" if sub_cat == "特串" else ""
         if sub_cat == "3中2":
             col1, col2 = st.columns(2)
             with col1: odds_val_1 = st.number_input("中2个赔率", value=odds_val_1, step=1.0)
@@ -472,10 +474,8 @@ with c_lottery:
         st_autorefresh(interval=60000, limit=None, key="high_freq_refresh")
         auto_sync_data(selected_lottery)
     else:
-        cache_key = f"synced_{selected_lottery}"
-        if cache_key not in st.session_state:
-            auto_sync_data(selected_lottery)
-            st.session_state[cache_key] = True
+        # 传统彩不静默抓，防封
+        pass
 
     try:
         query = f"SELECT issue as 期号, draw_time as 开奖日期, draw_code as 开奖号码 FROM lottery_data WHERE lottery_name = '{selected_lottery}'"
@@ -490,12 +490,10 @@ with c_lottery:
 with c_action:
     st.markdown("<div style='margin-top: 10px;'></div>", unsafe_allow_html=True)
     if st.button("立即手动补齐断档数据", use_container_width=True, type="primary"):
-        # 💡 调用智能断档补齐函数
         msg = force_sync_until_today(selected_lottery)
         st.session_state.sync_msg = msg
         st.rerun()
 
-# 💡 显示抓取结果提示
 if st.session_state.sync_msg:
     if "✅" in st.session_state.sync_msg:
         st.success(st.session_state.sync_msg)
@@ -520,7 +518,6 @@ if not df_all.empty:
         </div>
         """, unsafe_allow_html=True)
 
-# 💡 报警线设置与图表调节面板
 with st.expander("报警线设置与图表调节", expanded=False):
     st.caption("💡 填 0 或留空代表不设提醒。将根据最新一期累计盈亏是否突破该值来报警。")
     c_alert1, c_alert2 = st.columns(2)
@@ -619,7 +616,6 @@ def calculate_scheme_cached(df, scheme, time_filter=""):
     if not res_df.empty: res_df['累计盈亏'] = res_df['本期盈亏'].cumsum()
     return res_df
 
-# ================= 5. 测算结果展示 =================
 if not active_schemes:
     st.info("请在左侧勾选至少一个方案以展示测算结果。")
 else:
@@ -630,7 +626,6 @@ else:
         
     df_filtered["正码"], df_filtered["特码"] = zip(*df_filtered.apply(parse_draw, axis=1))
     
-    # 进度条初始化
     total_schemes = len(active_schemes)
     total_days = len(df_filtered)
     progress_text = f"正在计算历史盈亏... (共 {total_days} 期数据)"
@@ -641,21 +636,13 @@ else:
     
     for i, scheme in enumerate(active_schemes):
         res = calculate_scheme_cached(df_filtered, scheme, "")
-        
         scheme_results[scheme['id']] = res
-        
         if not res.empty:
             res['方案名称'] = scheme['name']
             all_res_dfs.append(res)
-            
-        # 更新进度条
         pct = int((i + 1) / total_schemes * 100)
-        my_bar.progress(
-            (i + 1) / total_schemes, 
-            text=f"正在计算方案: {scheme['name']} ({pct}%) | 已处理 {total_days} 期"
-        )
-        
-    my_bar.empty() # 算完后清除进度条
+        my_bar.progress((i + 1) / total_schemes, text=f"正在计算方案: {scheme['name']} ({pct}%) | 已处理 {total_days} 期")
+    my_bar.empty()
     
     if not all_res_dfs:
         st.warning("当前过滤条件下无数据。")
@@ -670,12 +657,10 @@ else:
     peak_issue = merged_pl.loc[merged_pl['累计盈亏'].idxmax(), '期号']
     low_peak_value = merged_pl['累计盈亏'].min()
     low_peak_issue = merged_pl.loc[merged_pl['累计盈亏'].idxmin(), '期号']
-    
     latest_pl = merged_pl.iloc[-1]['累计盈亏']
     
     alert_pos_val = st.session_state.pos_alert
     alert_neg_val = st.session_state.neg_alert
-    
     trigger_pos = (alert_pos_val != 0) and (latest_pl >= alert_pos_val)
     trigger_neg = (alert_neg_val != 0) and (latest_pl <= alert_neg_val)
     
