@@ -99,7 +99,7 @@ def force_sync_until_today(lottery_name, force_days=3):
     end_date = datetime.today().date()
     
     try:
-        # 💡 查出库里最新一条数据的期号，并转为整数
+        # 查出库里最新一条数据的期号，并转为整数
         df_old = pd.read_sql(f"SELECT draw_time, issue FROM lottery_data WHERE lottery_name = '{lottery_name}' ORDER BY draw_time DESC LIMIT 1", engine)
         if df_old.empty:
             start_date = end_date - timedelta(days=30)
@@ -151,7 +151,7 @@ def force_sync_until_today(lottery_name, force_days=3):
     df_new = pd.DataFrame(all_new_data)
     df_new['issue'] = df_new['issue'].astype(str).str.strip()
     
-    # 💡 核心护城河：用数值比大小，接口返回的期号必须大于库里的，否则当垃圾丢弃
+    # 核心护城河：用数值比大小，接口返回的期号必须大于库里的，否则当垃圾丢弃
     df_new['issue_int'] = pd.to_numeric(df_new['issue'], errors='coerce').fillna(0).astype(int)
     df_new = df_new[df_new['issue_int'] > db_max_issue]
     
@@ -419,15 +419,24 @@ with c_lottery:
     
     is_high_freq = ("宾果" in selected_lottery or "加拿大" in selected_lottery)
     
-    # ✅ 每天打开页面，必定自动同步一次，不再需要手动点
-    sync_key = f"last_sync_{selected_lottery}"
-    if st.session_state.get(sync_key) != today:
+    # ✅ 破解时间锁核心改动：
+    # 记录最后一次同步的【时间戳】，而不是日期。
+    # 每 5 分钟（300秒）允许同步一次。
+    sync_time_key = f"last_sync_time_{selected_lottery}"
+    current_time = time.time()
+    last_sync = st.session_state.get(sync_time_key, 0)
+    
+    if current_time - last_sync > 300: # 超过 300 秒才允许再次请求接口
         with st.spinner("正在自动同步最新数据..."):
             auto_sync_data(selected_lottery)
-        st.session_state[sync_key] = today
+        st.session_state[sync_time_key] = current_time
         
+    # 让低频彩也能自动刷新，不用手动点
     if is_high_freq:
         st_autorefresh(interval=60000, limit=None, key="high_freq_refresh")
+    else:
+        # 低频彩每 5 分钟静默刷新一次页面，数据如果有更新会自动跳出来
+        st_autorefresh(interval=300000, limit=None, key="low_freq_refresh")
 
     try:
         query = f"SELECT issue as 期号, draw_time as 开奖日期, draw_code as 开奖号码 FROM lottery_data WHERE lottery_name = '{selected_lottery}'"
