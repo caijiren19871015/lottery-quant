@@ -92,7 +92,7 @@ LOTTERY_MAP = {
     "加拿大六合彩": {"code": "JNDLHC", "type": "gpc"}
 }
 
-# 💡 低频彩专用：强制查最新接口，带期号护城河，确保不漏期
+# 💡 低频彩专用（手动触发）
 def force_sync_low_freq(lottery_name):
     config = LOTTERY_MAP.get(lottery_name)
     if not config: return "未知彩种"
@@ -106,7 +106,7 @@ def force_sync_low_freq(lottery_name):
     all_new_data = []
     headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://166w2.com/"}
     
-    # 1. 先查前端专用的最新接口
+    # 查最新接口
     url = f"https://data.kai8.us/api/lottery/issue/KAI166/{config['code']}"
     try:
         res = requests.get(url, headers=headers, timeout=5)
@@ -121,7 +121,7 @@ def force_sync_low_freq(lottery_name):
                 })
     except Exception: pass
         
-    # 2. 如果最新接口没拿到，或者为了补齐断档，回溯 3 天
+    # 兜底查3天
     if not all_new_data or int(all_new_data[0]["issue"]) <= db_max_issue:
         end_date = datetime.today().date()
         start_date = end_date - timedelta(days=3)
@@ -144,8 +144,6 @@ def force_sync_low_freq(lottery_name):
     df_new = df_new.dropna(subset=['draw_time', 'draw_code'])
     df_new['issue'] = df_new['issue'].astype(str).str.strip()
     df_new['issue_int'] = pd.to_numeric(df_new['issue'], errors='coerce').fillna(0).astype(int)
-    
-    # 过滤老数据
     df_new = df_new[df_new['issue_int'] > db_max_issue]
     
     if df_new.empty:
@@ -161,6 +159,8 @@ def force_sync_low_freq(lottery_name):
         if not df_new.empty:
             df_to_save = df_new.drop(columns=['issue_int'])
             df_to_save.to_sql('lottery_data', engine, if_exists='append', index=False)
+            # 💡 清理数据库读取缓存，让下次读库能拿到最新数据
+            load_data_from_db.clear()
             return f"✅ 补齐完成，新增 {len(df_new)} 条！最新一期: {df_new['issue_int'].max()}"
         else:
             return f"✅ 已是最新（接口数据已存在于库）"
@@ -168,8 +168,8 @@ def force_sync_low_freq(lottery_name):
         return f"❌ 写入数据库失败: {e}"
 
 
-# 💡 高频彩专用：原汁原味恢复原版逻辑，仅扫增量，绝不卡顿
-def auto_sync_data(lottery_name):
+# 💡 高频彩专用（自动触发，防抖防卡）
+def auto_sync_high_freq(lottery_name):
     config = LOTTERY_MAP.get(lottery_name)
     if not config: return False
     end_date = datetime.today().date()
@@ -187,7 +187,6 @@ def auto_sync_data(lottery_name):
     for day_offset in range(delta_days):
         target_date = start_date + timedelta(days=day_offset)
         y, m, d = target_date.strftime("%Y"), target_date.month, target_date.day
-        # 仅处理高频彩
         for h in range(24):
             url = f"https://data.kai8.us/api/lottery/history_gpc/KAI166/{config['code']}/{y}-{m:02d}-{d:02d}/{h}/30"
             try:
@@ -210,9 +209,19 @@ def auto_sync_data(lottery_name):
         df_new = df_new[~df_new['issue'].isin(existing)]
         if not df_new.empty:
             df_new.to_sql('lottery_data', engine, if_exists='append', index=False)
+            load_data_from_db.clear()
             return True
     except Exception: pass
     return False
+
+# ================= 💾 数据库缓存层 (修复卡顿核心) =================
+@st.cache_data(ttl=10, show_spinner=False)
+def load_data_from_db(lottery_name):
+    query = f"SELECT issue as 期号, draw_time as 开奖日期, draw_code as 开奖号码 FROM lottery_data WHERE lottery_name = '{lottery_name}'"
+    df = pd.read_sql(query, engine)
+    df["开奖日期"] = pd.to_datetime(df["开奖日期"], errors='coerce').dt.tz_localize(None)
+    df["日期_only"] = df["开奖日期"].dt.date
+    return df.dropna(subset=["开奖日期"]).sort_values(by="期号", ascending=True)
 
 # ================= 💾 方案云端保存 =================
 def save_scheme_to_db(scheme):
@@ -455,40 +464,28 @@ with c_lottery:
     
     is_high_freq = ("宾果" in selected_lottery or "加拿大" in selected_lottery)
     
-    # ✅ 完美隔离：高频走原版自动同步，低频走强制秒杀补齐
+    # 高频彩：保留1分钟自动刷新，且防抖
     if is_high_freq:
         st_autorefresh(interval=60000, limit=None, key="high_freq_refresh")
-        auto_sync_data(selected_lottery)
-    else:
-        # 低频的时间锁：5分钟只拉一次，防止被接口封禁
         sync_time_key = f"last_sync_time_{selected_lottery}"
         current_time = time.time()
         last_sync = st.session_state.get(sync_time_key, 0)
-        if current_time - last_sync > 300:
-            force_sync_low_freq(selected_lottery)
+        if current_time - last_sync > 50: # 50秒内只同步一次
+            auto_sync_high_freq(selected_lottery)
             st.session_state[sync_time_key] = current_time
-        # 低频不强制秒级刷新，但挂个5分钟的自动刷新，防止开奖后不更新
-        st_autorefresh(interval=300000, limit=None, key="low_freq_refresh")
-
-    try:
-        query = f"SELECT issue as 期号, draw_time as 开奖日期, draw_code as 开奖号码 FROM lottery_data WHERE lottery_name = '{selected_lottery}'"
-        df_all = pd.read_sql(query, engine)
-        df_all["开奖日期"] = pd.to_datetime(df_all["开奖日期"], errors='coerce').dt.tz_localize(None)
-        df_all["日期_only"] = df_all["开奖日期"].dt.date
-        df_all = df_all.dropna(subset=["开奖日期"]).sort_values(by="期号", ascending=True)
-    except Exception as e:
-        st.error(f"读取图表数据失败: {e}")
-        df_all = pd.DataFrame()
+            
+    # 读取数据（走缓存）
+    df_all = load_data_from_db(selected_lottery)
 
 with c_action:
     st.markdown("<div style='margin-top: 10px;'></div>", unsafe_allow_html=True)
     if st.button("立即手动补齐断档数据", use_container_width=True, type="primary"):
-        # 手动点按钮时，低频走强制秒杀，高频走原版逻辑
-        if is_high_freq:
-            auto_sync_data(selected_lottery)
-            msg = "✅ 高频彩自动同步已完成"
-        else:
-            msg = force_sync_low_freq(selected_lottery)
+        with st.spinner("正在请求最新数据..."):
+            if is_high_freq:
+                auto_sync_high_freq(selected_lottery)
+                msg = "✅ 高频彩自动同步已完成"
+            else:
+                msg = force_sync_low_freq(selected_lottery)
         st.session_state.sync_msg = msg
         st.rerun()
 
@@ -539,8 +536,9 @@ with st.expander("报警线设置与图表调节", expanded=False):
             st.query_params["dtick_val"] = str(new_dtick)
             st.rerun()
 
+# 💡 计算逻辑走缓存，防止重算（修复卡顿的终极武器）
 @st.cache_data(show_spinner=False)
-def calculate_scheme_cached(df, scheme, time_filter=""):
+def calculate_scheme_cached(df_filtered, scheme, time_filter=""):
     cat, sub = scheme['category'], scheme['sub_type']
     if cat == "特码类": bet_count = len(scheme['numbers'])
     elif cat == "连码复式":
@@ -555,7 +553,7 @@ def calculate_scheme_cached(df, scheme, time_filter=""):
     actual_cost = bet_count * scheme['bet'] * (1 - scheme['rebate'])
 
     results = []
-    for _, row in df.iterrows():
+    for _, row in df_filtered.iterrows():
         if time_filter and time_filter not in row['开奖日期'].strftime('%H:%M'): continue
         draw_normals, draw_special = set(row['正码']), row['特码']
         h2, h3, hn = 0, 0, 0
