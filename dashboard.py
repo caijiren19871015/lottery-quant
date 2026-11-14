@@ -228,6 +228,19 @@ def save_scheme_to_db(scheme):
     except Exception as e: 
         st.error(f"方案保存云端失败: {e}")
 
+# 💡 批量保存，防止并发把连接池打爆
+def save_batch_schemes_to_db(schemes):
+    if not schemes: return
+    try:
+        ids = [s["id"] for s in schemes]
+        with engine.begin() as conn:
+            conn.execute(text("DELETE FROM saved_schemes WHERE id = ANY(:ids)"), {"ids": ids})
+        
+        df = pd.DataFrame([{"id": s["id"], "scheme_json": json.dumps(s)} for s in schemes])
+        df.to_sql('saved_schemes', engine, if_exists='append', index=False)
+    except Exception as e:
+        st.error(f"批量保存失败: {e}")
+
 def delete_scheme_from_db(scheme_id):
     try:
         with engine.begin() as conn:
@@ -439,19 +452,49 @@ if st.session_state.schemes:
             if g_name == "（未分组）":
                 for s in s_list: render_scheme_row(s)
             else:
-                # 💡 1. 计算当前大方案的状态：如果全选，则为 True；只要有一个没选，就是 False
                 group_active = all(s['active'] for s in s_list)
-                
-                # 💡 2. 渲染大方案的 Checkbox
                 new_group_active = st.checkbox(f"**组合: {g_name}**", value=group_active, key=f"grp_{g_name}")
                 
-                # 💡 3. 一旦点击发生变化，强制更新底下所有小方案的 session_state
                 if new_group_active != group_active:
                     for s in s_list:
                         s['active'] = new_group_active
                         st.session_state[f"chk_{s['id']}"] = new_group_active
-                        save_scheme_to_db(s)
+                    save_batch_schemes_to_db(s_list) 
                     st.rerun()
+
+                # ================= 💡 新增：大方案批量修改面板 =================
+                with st.expander(f"🛠️ 批量修改 {g_name} 配置", expanded=False):
+                    c_b1, c_b2 = st.columns(2)
+                    with c_b1:
+                        b_bet = st.number_input("单注金额", value=0, step=1, help="填 0 不修改", key=f"b_bet_{g_name}")
+                        b_odd1 = st.number_input("赔率 1", value=0.0, step=1.0, help="填 0 不修改", key=f"b_odd1_{g_name}")
+                    with c_b2:
+                        b_rebate = st.number_input("退水比例", value=-1.0, step=0.005, format="%.3f", help="填 -1 不修改", key=f"b_rebate_{g_name}")
+                        b_odd2 = st.number_input("赔率 2 (3中2用)", value=0.0, step=1.0, help="填 0 不修改", key=f"b_odd2_{g_name}")
+                    
+                    if st.button("✅ 应用批量修改", key=f"apply_b_{g_name}", use_container_width=True):
+                        changed = False
+                        for s in s_list:
+                            if b_bet > 0 and s['bet'] != int(b_bet):
+                                s['bet'] = int(b_bet)
+                                changed = True
+                            if b_rebate >= 0 and s['rebate'] != b_rebate:
+                                s['rebate'] = b_rebate
+                                changed = True
+                            if b_odd1 > 0 and s.get('odds_1') != b_odd1:
+                                s['odds_1'] = b_odd1
+                                changed = True
+                            if b_odd2 > 0 and s.get('odds_2') is not None and s.get('odds_2') != b_odd2:
+                                s['odds_2'] = b_odd2
+                                changed = True
+                                
+                        if changed:
+                            save_batch_schemes_to_db(s_list)
+                            st.toast(f"组合 {g_name} 批量修改已生效")
+                            st.rerun()
+                        else:
+                            st.info("数值未发生变化或尚未填写修改项。")
+                # =========================================================
 
                 with st.expander(f"查看 {g_name} 内的方案", expanded=False):
                     for s in s_list: render_scheme_row(s)
@@ -644,7 +687,7 @@ else:
         
     my_bar.empty()
 
-    # ================= 🚀 新增：全局合并顶图 =================
+    # ================= 🚀 全局合并顶图 =================
     if all_res_dfs:
         combined_all_df = pd.concat(all_res_dfs)
         global_merged = combined_all_df.groupby(['期号', '开奖日期']).agg({'命中注数': 'sum', '本期盈亏': 'sum'}).reset_index()
