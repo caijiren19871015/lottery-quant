@@ -468,14 +468,16 @@ with c_lottery:
     
     is_high_freq = ("宾果" in selected_lottery or "加拿大" in selected_lottery)
     
+    # ✅ 调整点：香港/快乐8 也享受页面加载时的自动同步，不再被 cache_key 拦截
     if is_high_freq:
         st_autorefresh(interval=60000, limit=None, key="high_freq_refresh")
         auto_sync_data(selected_lottery)
     else:
-        cache_key = f"synced_{selected_lottery}"
-        if cache_key not in st.session_state:
+        # 如果当前 session 的最后同步时间不是今天，就同步一次
+        sync_key = f"last_sync_{selected_lottery}"
+        if st.session_state.get(sync_key) != today:
             auto_sync_data(selected_lottery)
-            st.session_state[cache_key] = True
+            st.session_state[sync_key] = today
 
     try:
         query = f"SELECT issue as 期号, draw_time as 开奖日期, draw_code as 开奖号码 FROM lottery_data WHERE lottery_name = '{selected_lottery}'"
