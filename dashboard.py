@@ -439,21 +439,20 @@ if st.session_state.schemes:
             if g_name == "（未分组）":
                 for s in s_list: render_scheme_row(s)
             else:
-                st.markdown(f"**组合: {g_name}**")
-                col_a, col_b = st.columns(2)
-                if col_a.button("✅ 全选", key=f"sel_all_{g_name}", use_container_width=True):
+                # 💡 1. 计算当前大方案的状态：如果全选，则为 True；只要有一个没选，就是 False
+                group_active = all(s['active'] for s in s_list)
+                
+                # 💡 2. 渲染大方案的 Checkbox
+                new_group_active = st.checkbox(f"**组合: {g_name}**", value=group_active, key=f"grp_{g_name}")
+                
+                # 💡 3. 一旦点击发生变化，强制更新底下所有小方案的 session_state
+                if new_group_active != group_active:
                     for s in s_list:
-                        s['active'] = True
-                        st.session_state[f"chk_{s['id']}"] = True
+                        s['active'] = new_group_active
+                        st.session_state[f"chk_{s['id']}"] = new_group_active
                         save_scheme_to_db(s)
                     st.rerun()
-                if col_b.button("❌ 取消", key=f"desel_all_{g_name}", use_container_width=True):
-                    for s in s_list:
-                        s['active'] = False
-                        st.session_state[f"chk_{s['id']}"] = False
-                        save_scheme_to_db(s)
-                    st.rerun()
-                    
+
                 with st.expander(f"查看 {g_name} 内的方案", expanded=False):
                     for s in s_list: render_scheme_row(s)
 
