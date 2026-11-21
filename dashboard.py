@@ -39,6 +39,7 @@ st.markdown("""
     .text-gray { color: #A3A3A3; font-size: 13px; }
     .peak-text-pos { color: #22C55E; font-size: 13px; font-weight: bold; margin-top: 5px; }
     .peak-text-neg { color: #EF4444; font-size: 13px; font-weight: bold; margin-top: 3px; }
+    .red-warning-box { background-color: rgba(239, 68, 68, 0.1); border: 1px solid #EF4444; border-radius: 6px; padding: 15px; margin-bottom: 15px; }
     </style>
 """, unsafe_allow_html=True)
 
@@ -163,6 +164,77 @@ def force_sync_low_freq(lottery_name):
     except Exception as e:
         return f"❌ 写入数据库失败: {e}"
 
+# 💡 新增：彻底清空并全量重拉函数
+def wipe_and_refetch_all(lottery_name, days_to_fetch):
+    config = LOTTERY_MAP.get(lottery_name)
+    if not config: return "未知彩种"
+    is_high_freq = ("宾果" in lottery_name or "加拿大" in lottery_name)
+    
+    # 1. 彻底清空该彩种数据
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("DELETE FROM lottery_data WHERE lottery_name = :name"), {"name": lottery_name})
+        load_data_from_db.clear()
+    except Exception as e:
+        return f"❌ 清空旧数据失败: {e}"
+
+    # 2. 重新拉取指定天数数据
+    all_new_data = []
+    headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://166w2.com/"}
+    end_date = datetime.today().date()
+    start_date = end_date - timedelta(days=days_to_fetch)
+    
+    progress_bar = st.progress(0, text="正在重新拉取数据，请勿关闭页面...")
+    total_days = days_to_fetch + 1
+
+    for idx, day_offset in enumerate(range(total_days)):
+        target_date = start_date + timedelta(days=day_offset)
+        y, m, d = target_date.strftime("%Y"), target_date.month, target_date.day
+        
+        if is_high_freq:
+            for h in range(24):
+                url = f"https://data.kai8.us/api/lottery/history_gpc/KAI166/{config['code']}/{y}-{m:02d}-{d:02d}/{h}/30"
+                try:
+                    res = requests.get(url, headers=headers, timeout=5)
+                    if res.status_code == 200:
+                        for item in res.json().get("data", {}).get("list", []):
+                            all_new_data.append({"lottery_name": lottery_name, "issue": str(item.get("issue")).strip(), "draw_time": item.get("draw_time"), "draw_code": item.get("draw_code")})
+                except Exception: pass
+                time.sleep(0.01)
+        else:
+            url = f"https://data.kai8.us/api/lottery/history_dpc/KAI166/{config['code']}/{y}/{m}/{d}"
+            try:
+                res = requests.get(url, headers=headers, timeout=5)
+                if res.status_code == 200:
+                    for item in res.json().get("data", {}).get("list", []):
+                        all_new_data.append({"lottery_name": lottery_name, "issue": str(item.get("issue")).strip(), "draw_time": item.get("draw_time"), "draw_code": item.get("draw_code")})
+            except Exception: pass
+            time.sleep(0.05)
+            
+        progress_bar.progress((idx + 1) / total_days, text=f"正在拉取 {target_date} 的数据... ({idx+1}/{total_days})")
+
+    progress_bar.empty()
+
+    # 3. 写入新数据
+    if not all_new_data:
+        return f"🧹 已彻底清空数据，但接口未返回最近 {days_to_fetch} 天的任何数据。"
+
+    df_new = pd.DataFrame(all_new_data)
+    df_new = df_new.dropna(subset=['draw_time', 'draw_code'])
+    df_new['issue'] = df_new['issue'].astype(str).str.strip()
+    df_new['draw_time'] = pd.to_datetime(df_new['draw_time'], errors='coerce').dt.tz_localize(None)
+    df_new = df_new.dropna(subset=['draw_time']).drop_duplicates(subset=['lottery_name', 'issue'], keep='first')
+
+    if not df_new.empty:
+        try:
+            df_new.to_sql('lottery_data', engine, if_exists='append', index=False)
+            load_data_from_db.clear()
+            return f"✅ 彻底清空并重拉完成！成功写入 {len(df_new)} 条记录（范围：近 {days_to_fetch} 天）。"
+        except Exception as e:
+            return f"❌ 写入数据库失败: {e}"
+    else:
+        return f"🧹 已彻底清空旧数据，但重拉数据为空。"
+
 def auto_sync_high_freq(lottery_name):
     config = LOTTERY_MAP.get(lottery_name)
     if not config: return False
@@ -228,7 +300,6 @@ def save_scheme_to_db(scheme):
     except Exception as e: 
         st.error(f"方案保存云端失败: {e}")
 
-# 💡 批量保存，防止并发把连接池打爆
 def save_batch_schemes_to_db(schemes):
     if not schemes: return
     try:
@@ -268,6 +339,8 @@ if 'editing_id' not in st.session_state:
     st.session_state.editing_id = None
 if 'sync_msg' not in st.session_state:
     st.session_state.sync_msg = None
+if 'show_wipe_confirm' not in st.session_state:
+    st.session_state.show_wipe_confirm = False
 
 # URL 记忆
 if "chart_height" not in st.session_state: st.session_state.chart_height = int(st.query_params.get("chart_height", 350))
@@ -462,39 +535,52 @@ if st.session_state.schemes:
                     save_batch_schemes_to_db(s_list) 
                     st.rerun()
 
-                # ================= 💡 新增：大方案批量修改面板 =================
                 with st.expander(f"🛠️ 批量修改 {g_name} 配置", expanded=False):
+                    sample_s = s_list[0] if s_list else {}
+                    default_bet = sample_s.get('bet', 10)
+                    default_reb = sample_s.get('rebate', 0.155)
+                    default_odd1 = sample_s.get('odds_1') if sample_s.get('odds_1') is not None else 700.0
+                    default_odd2 = sample_s.get('odds_2') if sample_s.get('odds_2') is not None else 0.0
+
                     c_b1, c_b2 = st.columns(2)
                     with c_b1:
-                        b_bet = st.number_input("单注金额", value=0, step=1, help="填 0 不修改", key=f"b_bet_{g_name}")
-                        b_odd1 = st.number_input("赔率 1", value=0.0, step=1.0, help="填 0 不修改", key=f"b_odd1_{g_name}")
+                        chk_bet = st.checkbox("修改单注金额", key=f"chk_b_{g_name}")
+                        b_bet = st.number_input("输入金额", value=int(default_bet), step=1, disabled=not chk_bet, key=f"b_bet_{g_name}", label_visibility="collapsed")
+                        
+                        chk_odd1 = st.checkbox("修改赔率 1", key=f"chk_o1_{g_name}")
+                        b_odd1 = st.number_input("输入赔率 1", value=float(default_odd1), step=1.0, disabled=not chk_odd1, key=f"b_odd1_{g_name}", label_visibility="collapsed")
                     with c_b2:
-                        b_rebate = st.number_input("退水比例", value=-1.0, step=0.005, format="%.3f", help="填 -1 不修改", key=f"b_rebate_{g_name}")
-                        b_odd2 = st.number_input("赔率 2 (3中2用)", value=0.0, step=1.0, help="填 0 不修改", key=f"b_odd2_{g_name}")
+                        chk_reb = st.checkbox("修改退水比例", key=f"chk_r_{g_name}")
+                        b_rebate = st.number_input("输入退水", value=float(default_reb), step=0.005, format="%.3f", disabled=not chk_reb, key=f"b_rebate_{g_name}", label_visibility="collapsed")
+                        
+                        chk_odd2 = st.checkbox("修改赔率 2", key=f"chk_o2_{g_name}")
+                        b_odd2 = st.number_input("输入赔率 2", value=float(default_odd2), step=1.0, disabled=not chk_odd2, key=f"b_odd2_{g_name}", label_visibility="collapsed")
                     
-                    if st.button("✅ 应用批量修改", key=f"apply_b_{g_name}", use_container_width=True):
-                        changed = False
-                        for s in s_list:
-                            if b_bet > 0 and s['bet'] != int(b_bet):
-                                s['bet'] = int(b_bet)
-                                changed = True
-                            if b_rebate >= 0 and s['rebate'] != b_rebate:
-                                s['rebate'] = b_rebate
-                                changed = True
-                            if b_odd1 > 0 and s.get('odds_1') != b_odd1:
-                                s['odds_1'] = b_odd1
-                                changed = True
-                            if b_odd2 > 0 and s.get('odds_2') is not None and s.get('odds_2') != b_odd2:
-                                s['odds_2'] = b_odd2
-                                changed = True
-                                
-                        if changed:
-                            save_batch_schemes_to_db(s_list)
-                            st.toast(f"组合 {g_name} 批量修改已生效")
-                            st.rerun()
+                    if st.button("✅ 应用勾选的修改", key=f"apply_b_{g_name}", use_container_width=True):
+                        if not (chk_bet or chk_reb or chk_odd1 or chk_odd2):
+                            st.warning("请先勾选需要修改的项目")
                         else:
-                            st.info("数值未发生变化或尚未填写修改项。")
-                # =========================================================
+                            changed = False
+                            for s in s_list:
+                                if chk_bet and s['bet'] != int(b_bet):
+                                    s['bet'] = int(b_bet)
+                                    changed = True
+                                if chk_reb and s['rebate'] != b_rebate:
+                                    s['rebate'] = b_rebate
+                                    changed = True
+                                if chk_odd1 and s.get('odds_1') != b_odd1:
+                                    s['odds_1'] = b_odd1
+                                    changed = True
+                                if chk_odd2 and s.get('odds_2') is not None and s.get('odds_2') != b_odd2:
+                                    s['odds_2'] = b_odd2
+                                    changed = True
+                                    
+                            if changed:
+                                save_batch_schemes_to_db(s_list)
+                                st.toast(f"组合 {g_name} 批量修改已生效")
+                                st.rerun()
+                            else:
+                                st.info("数值未发生变化。")
 
                 with st.expander(f"查看 {g_name} 内的方案", expanded=False):
                     for s in s_list: render_scheme_row(s)
@@ -522,15 +608,55 @@ with c_lottery:
 
 with c_action:
     st.markdown("<div style='margin-top: 10px;'></div>", unsafe_allow_html=True)
-    if st.button("立即手动补齐断档数据", use_container_width=True, type="primary"):
-        with st.spinner("正在请求最新数据..."):
-            if is_high_freq:
-                auto_sync_high_freq(selected_lottery)
-                msg = "✅ 高频彩自动同步已完成"
-            else:
-                msg = force_sync_low_freq(selected_lottery)
-        st.session_state.sync_msg = msg
-        st.rerun()
+    
+    col_btn1, col_btn2 = st.columns([1, 1])
+    with col_btn1:
+        if st.button("立即手动补齐断档数据", use_container_width=True, type="primary"):
+            with st.spinner("正在请求最新数据..."):
+                if is_high_freq:
+                    auto_sync_high_freq(selected_lottery)
+                    msg = "✅ 高频彩自动同步已完成"
+                else:
+                    msg = force_sync_low_freq(selected_lottery)
+            st.session_state.sync_msg = msg
+            st.rerun()
+            
+    with col_btn2:
+        if st.button("🚨 清空该彩种所有数据并重拉", use_container_width=True, type="secondary"):
+            st.session_state.show_wipe_confirm = True
+            st.rerun()
+
+# 💡 弹窗确认交互区
+if st.session_state.get('show_wipe_confirm', False):
+    st.markdown("""
+    <div class="red-warning-box">
+        <h4 style="color: #EF4444; margin-top: 0;">⚠️ 高危操作确认</h4>
+        <p style="color: #FCA5A5; font-size: 14px;">
+            您正在尝试<strong>彻底清空</strong>【%s】在云端数据库里的<strong>所有历史数据</strong>！<br>
+            此操作不可逆。请设置需要重新拉取的天数，并确认无误后再执行。
+        </p>
+    </div>
+    """ % selected_lottery, unsafe_allow_html=True)
+    
+    col_wipe1, col_wipe2 = st.columns([1, 1])
+    with col_wipe1:
+        wipe_days = st.number_input("重新拉取最近多少天的数据？", min_value=1, max_value=1000, value=30, step=1)
+    with col_wipe2:
+        st.markdown("<div style='margin-top: 28px;'></div>", unsafe_allow_html=True)
+        is_confirmed = st.checkbox("我已了解后果，确认清空并重拉")
+        
+    col_act1, col_act2 = st.columns([1, 1])
+    with col_act1:
+        if st.button("确认执行清空", type="primary", use_container_width=True, disabled=not is_confirmed):
+            st.session_state.show_wipe_confirm = False
+            with st.spinner(f"正在彻底清空 {selected_lottery} 并拉取近 {wipe_days} 天数据..."):
+                msg = wipe_and_refetch_all(selected_lottery, wipe_days)
+            st.session_state.sync_msg = msg
+            st.rerun()
+    with col_act2:
+        if st.button("取消", use_container_width=True):
+            st.session_state.show_wipe_confirm = False
+            st.rerun()
 
 # 💡 显示抓取结果提示
 if st.session_state.sync_msg:
@@ -662,8 +788,15 @@ if not active_schemes:
 else:
     df_filtered = df_all[(df_all["日期_only"] >= start_date) & (df_all["日期_only"] <= end_date)].copy()
     if df_filtered.empty:
-        st.warning("当前日期范围内云端没有数据！请调整左侧时间范围。")
+        st.warning("当前日期范围内云端没有数据！请调整左侧时间范围或尝试清空重拉。")
         st.stop()
+    
+    # 💡 增加缺失开奖记录提醒
+    expected_days = (end_date - start_date).days + 1
+    actual_days = len(df_filtered['日期_only'].unique())
+    if actual_days < expected_days:
+        missing_days = expected_days - actual_days
+        st.warning(f"⚠️ 注意：所选范围内有 {missing_days} 天无开奖记录。如确认漏数据，请使用上方【清空该彩种所有数据并重拉】功能。")
         
     df_filtered["正码"], df_filtered["特码"] = zip(*df_filtered.apply(parse_draw, axis=1))
     
@@ -861,6 +994,6 @@ else:
                 yaxis=dict(dtick=st.session_state.dtick_val)
             )
             fig.add_scatter(x=[s_peak_issue], y=[s_peak_value], mode='markers+text', text=[f"最高: {s_peak_value:,.0f}"], textposition="top center", marker=dict(size=8, color='#22C55E', symbol='star'), textfont=dict(color='#22C55E', size=10))
-            fig.add_scatter(x=[s_low_peak_issue], y=[s_low_peak_value], mode='markers+text', text=[f"最低: {s_low_peak_value:,.0f}"], textposition="bottom center", marker=dict(size=8, color='#EF4444', symbol='star'), textfont=dict(color='#EF4444', size=10))
+            fig.add_scatter(x=[s_low_peak_issue], y=[s_low_peak_val], mode='markers+text', text=[f"最低: {s_low_peak_val:,.0f}"], textposition="bottom center", marker=dict(size=8, color='#EF4444', symbol='star'), textfont=dict(color='#EF4444', size=10))
             fig.update_traces(selector=dict(type='scatter', mode='lines+markers'), line_color='#22C55E', line_width=2)
             st.plotly_chart(fig, use_container_width=True, key=f"chart_single")
